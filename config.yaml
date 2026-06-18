@@ -22,6 +22,7 @@ train:
   weight_decay: 0.0005
   test_batch_size: 256
   num_workers: 2
+  router_balance_weight: 0.01
 
 server:
   val_size: 1000

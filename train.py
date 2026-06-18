@@ -1,7 +1,7 @@
 # train.py
 # ------------------------------------------------------------
 # 最小版 FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
-
+#
 # 功能：
 # 1. 读取 config.yaml
 # 2. 加载 CIFAR10
@@ -13,10 +13,6 @@
 # 6. 每轮测试全局模型准确率
 # 7. 自动保存训练日志到 dataset.data_root/logs/train.log
 #
-# 当前只支持两种聚合方式：
-#   - uniform：每个客户端权重相同
-#   - sample_weighted：按客户端样本数加权
-
 # 新增功能：
 # 1. 从测试集划分 server validation set
 # 2. 客户端本地训练时统计：
@@ -26,8 +22,9 @@
 #    - 调用 meta_aggregator.py 里的 MetaExpertAggregator
 #    - 用服务器验证集 loss 更新元网络
 #    - 再用元网络输出最终 expert 聚合权重
-# 4. 保留自动日志保存
-# 5. 保留固定顺序客户端，不随机选择
+# 4. 加入 router balance loss，缓解 expert 激活塌缩
+# 5. 保留自动日志保存
+# 6. 保留固定顺序客户端，不随机选择
 # ------------------------------------------------------------
 
 import argparse
@@ -447,7 +444,58 @@ def build_test_loader(test_set, cfg, device):
 
 
 # ------------------------------------------------------------
-# 11. 本地训练
+# 11. Router balance loss
+# ------------------------------------------------------------
+def compute_router_balance_loss(router_probs):
+    """
+    计算 router balance loss，缓解 expert 激活塌缩。
+
+    输入：
+        router_probs:
+            shape 可以是：
+                [batch_size, num_experts]
+            或：
+                [batch_size, num_tokens, num_experts]
+
+    输出：
+        balance_loss:
+            标量。
+
+    核心思想：
+        希望一个 batch 内，各 expert 的平均 soft 路由概率接近均匀分布。
+
+    注意：
+        这里必须用 router_probs 这种 soft probability。
+        不能用 top1_indices 算 loss，因为 top1_indices 是离散选择，
+        对 router 没有可用梯度。
+    """
+
+    if router_probs.dim() == 3:
+        num_experts = router_probs.size(-1)
+        router_probs = router_probs.reshape(-1, num_experts)
+
+    elif router_probs.dim() == 2:
+        num_experts = router_probs.size(-1)
+
+    else:
+        raise ValueError(
+            f"router_probs 维度不对，期望 [B, E] 或 [B, T, E]，实际是 {router_probs.shape}"
+        )
+
+    # 当前 batch 里每个 expert 的平均 soft 路由概率
+    mean_probs = router_probs.mean(dim=0)
+
+    # 目标是均匀使用所有 expert
+    target_probs = torch.ones_like(mean_probs) / num_experts
+
+    # 偏离均匀分布越远，loss 越大
+    balance_loss = torch.sum((mean_probs - target_probs) ** 2)
+
+    return balance_loss
+
+
+# ------------------------------------------------------------
+# 12. 本地训练
 # ------------------------------------------------------------
 def local_train(global_state_dict, train_loader, cfg, device):
     """
@@ -466,6 +514,10 @@ def local_train(global_state_dict, train_loader, cfg, device):
     model_cfg = cfg["model"]
 
     num_experts = model_cfg["num_experts"]
+
+    # router balance loss 权重
+    # 默认 0.0，表示不启用。
+    router_balance_weight = train_cfg.get("router_balance_weight", 0.0)
 
     model = build_model(cfg)
     model.load_state_dict(global_state_dict)
@@ -499,7 +551,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
             optimizer.zero_grad()
 
-            # return_info=True 会返回 router 的 top1 expert id
+            # return_info=True 会返回 router 的 top1 expert id 和 router_probs
             logits, info = model(images, return_info=True)
 
             # 更新 expert 激活次数
@@ -508,13 +560,38 @@ def local_train(global_state_dict, train_loader, cfg, device):
                 top1_indices=info["top1_indices"],
             )
 
-            loss = criterion(logits, labels)
+            # 纯分类损失
+            ce_loss = criterion(logits, labels)
+
+            # router balance loss，默认不启用
+            balance_loss = torch.tensor(
+                0.0,
+                device=device,
+            )
+
+            if router_balance_weight > 0:
+                if "router_probs" not in info:
+                    raise ValueError(
+                        "model(images, return_info=True) 没有返回 router_probs，"
+                        "请先在 model.py 的 info 里加入 router_probs。"
+                    )
+
+                balance_loss = compute_router_balance_loss(
+                    info["router_probs"]
+                )
+
+            # 反向传播使用总 loss
+            loss = ce_loss + router_balance_weight * balance_loss
 
             loss.backward()
             optimizer.step()
 
             batch_size = images.size(0)
-            total_loss += loss.item() * batch_size
+
+            # 注意：
+            # client_loss 仍然记录纯 CE loss，
+            # 不记录加了 balance_loss 的总 loss。
+            total_loss += ce_loss.item() * batch_size
             total_samples += batch_size
 
     avg_loss = total_loss / max(total_samples, 1)
@@ -538,7 +615,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
 
 # ------------------------------------------------------------
-# 12. 测试全局模型
+# 13. 测试全局模型
 # ------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, test_loader, device):
@@ -576,7 +653,7 @@ def evaluate(model, test_loader, device):
 
 
 # ------------------------------------------------------------
-# 13. 普通聚合权重
+# 14. 普通聚合权重
 # ------------------------------------------------------------
 def get_aggregation_weights(method, client_num_samples):
     """
@@ -599,7 +676,7 @@ def get_aggregation_weights(method, client_num_samples):
 
 
 # ------------------------------------------------------------
-# 14. 普通聚合客户端参数
+# 15. 普通聚合客户端参数
 # ------------------------------------------------------------
 def aggregate_state_dicts(
     client_state_dicts,
@@ -657,7 +734,7 @@ def aggregate_state_dicts(
 
 
 # ------------------------------------------------------------
-# 15. 打印客户端划分信息
+# 16. 打印客户端划分信息
 # ------------------------------------------------------------
 def print_partition_summary(client_indices):
     """
@@ -673,7 +750,7 @@ def print_partition_summary(client_indices):
 
 
 # ------------------------------------------------------------
-# 16. 打印 meta alpha
+# 17. 打印 meta alpha
 # ------------------------------------------------------------
 def print_meta_alpha(alpha):
     """
@@ -699,7 +776,7 @@ def print_meta_alpha(alpha):
 
 
 # ------------------------------------------------------------
-# 17. 主训练流程
+# 18. 主训练流程
 # ------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -837,6 +914,7 @@ def main():
     print(f"lr                : {train_cfg['lr']}")
     print(f"momentum          : {train_cfg.get('momentum', 0.9)}")
     print(f"weight_decay      : {train_cfg.get('weight_decay', 0.0005)}")
+    print(f"router_balance_w  : {train_cfg.get('router_balance_weight', 0.0)}")
     print(f"non_expert_agg    : {non_expert_agg}")
     print(f"expert_agg        : {expert_agg}")
 
@@ -957,7 +1035,7 @@ def main():
 
 
 # ------------------------------------------------------------
-# 18. 程序入口
+# 19. 程序入口
 # ------------------------------------------------------------
 if __name__ == "__main__":
     main()
