@@ -14,6 +14,7 @@ model:
 
 train:
   rounds: 50
+  clients_per_round: 10
   local_epochs: 1
   batch_size: 64
   lr: 0.01
@@ -22,7 +23,19 @@ train:
   test_batch_size: 256
   num_workers: 2
 
+server:
+  val_size: 1000
+  val_batch_size: 256
+
+meta:
+  hidden_dim: 32
+  lr: 0.001
+  steps: 1
+  max_val_batches: 4
+
 aggregation:
-  #uniform/sample_weighted
+  # non_expert_agg 支持：uniform / sample_weighted
   non_expert_agg: sample_weighted
-  expert_agg: sample_weighted
+
+  # expert_agg 支持：uniform / sample_weighted / meta_network
+  expert_agg: meta_network
