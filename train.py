@@ -23,8 +23,9 @@
 #    - 用服务器验证集 loss 更新元网络
 #    - 再用元网络输出最终 expert 聚合权重
 # 4. 加入 router balance loss，缓解 expert 激活塌缩
-# 5. 保留自动日志保存
-# 6. 保留固定顺序客户端，不随机选择
+# 5. 支持 top-k routing，其中 top_k 从 config.yaml 的 model.top_k 读取
+# 6. 保留自动日志保存
+# 7. 保留固定顺序客户端，不随机选择
 # ------------------------------------------------------------
 
 import argparse
@@ -109,6 +110,30 @@ def setup_logging(cfg):
     return log_path
 
 
+def run_without_file_logging(func, *args, **kwargs):
+    """
+    临时关闭 TeeLogger，只把输出显示到控制台，不写入 train.log。
+
+    用途：
+        torchvision 下载 CIFAR10 时会显示进度条。
+        如果不临时关闭日志，进度条会被写进 train.log，导致日志很乱。
+    """
+
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+
+    try:
+        result = func(*args, **kwargs)
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    return result
+
+
 # ------------------------------------------------------------
 # 1. 读取配置文件
 # ------------------------------------------------------------
@@ -168,6 +193,7 @@ def build_model(cfg):
         num_classes=dataset_cfg["num_classes"],
         num_experts=model_cfg["num_experts"],
         expert_hidden_dim=model_cfg["expert_hidden_dim"],
+        top_k=model_cfg.get("top_k", 1),
     )
 
     return model
@@ -183,6 +209,7 @@ def build_datasets(cfg):
 
     dataset_cfg = cfg["dataset"]
     data_root = dataset_cfg.get("data_root", "./data")
+    download_flag = dataset_cfg.get("download", True)
 
     normalize = transforms.Normalize(
         mean=(0.4914, 0.4822, 0.4465),
@@ -202,14 +229,14 @@ def build_datasets(cfg):
     train_set = datasets.CIFAR10(
         root=data_root,
         train=True,
-        download=True,
+        download=download_flag,
         transform=train_transform,
     )
 
     test_set = datasets.CIFAR10(
         root=data_root,
         train=False,
-        download=True,
+        download=download_flag,
         transform=test_transform,
     )
 
@@ -227,16 +254,6 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
         train_set 全部用于客户端训练；
         test_set 先划出 server validation set；
         剩下的 test_set 用于最终测试。
-
-    默认做 class-balanced 划分：
-        server.val_size = 1000
-        num_classes = 10
-
-    那么每类取：
-        1000 / 10 = 100 张
-
-    作为 server validation set。
-    剩下的测试样本作为 final test set。
     """
 
     server_cfg = cfg.get("server", {})
@@ -275,15 +292,11 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
     server_val_indices = []
     final_test_indices = []
 
-    # 逐类抽样，保证 server validation 每个类别数量一样
     for class_id in range(num_classes):
         class_indices = np.where(labels == class_id)[0]
         rng.shuffle(class_indices)
 
-        # 当前类别前 samples_per_class 张给 server validation
         class_val_indices = class_indices[:samples_per_class]
-
-        # 当前类别剩下的给最终测试
         class_test_indices = class_indices[samples_per_class:]
 
         server_val_indices.extend(class_val_indices.tolist())
@@ -311,9 +324,6 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
 def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
     """
     用 Dirichlet 分布划分 non-IID 客户端数据。
-
-    输入的 labels 是完整 train_set 的标签。
-    返回的 client_indices 是相对于 train_set 的索引。
     """
 
     rng = np.random.default_rng(seed)
@@ -389,8 +399,6 @@ def build_client_loaders(train_set, client_indices, cfg, device):
 def build_server_val_loader(server_val_set, cfg, device):
     """
     构建服务器验证集 DataLoader。
-
-    这个验证集只给元网络训练使用。
     """
 
     if server_val_set is None:
@@ -450,20 +458,6 @@ def compute_router_balance_loss(router_probs):
     """
     计算 router balance loss，缓解 expert 激活塌缩。
 
-    输入：
-        router_probs:
-            shape 可以是：
-                [batch_size, num_experts]
-            或：
-                [batch_size, num_tokens, num_experts]
-
-    输出：
-        balance_loss:
-            标量。
-
-    核心思想：
-        希望一个 batch 内，各 expert 的平均 soft 路由概率接近均匀分布。
-
     注意：
         这里必须用 router_probs 这种 soft probability。
         不能用 top1_indices 算 loss，因为 top1_indices 是离散选择，
@@ -482,13 +476,9 @@ def compute_router_balance_loss(router_probs):
             f"router_probs 维度不对，期望 [B, E] 或 [B, T, E]，实际是 {router_probs.shape}"
         )
 
-    # 当前 batch 里每个 expert 的平均 soft 路由概率
     mean_probs = router_probs.mean(dim=0)
-
-    # 目标是均匀使用所有 expert
     target_probs = torch.ones_like(mean_probs) / num_experts
 
-    # 偏离均匀分布越远，loss 越大
     balance_loss = torch.sum((mean_probs - target_probs) ** 2)
 
     return balance_loss
@@ -506,8 +496,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
         num_samples
         avg_loss
         expert_freq
-
-    其中 expert_freq 是当前客户端每个 expert 的激活频率。
     """
 
     train_cfg = cfg["train"]
@@ -515,8 +503,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
     num_experts = model_cfg["num_experts"]
 
-    # router balance loss 权重
-    # 默认 0.0，表示不启用。
     router_balance_weight = train_cfg.get("router_balance_weight", 0.0)
 
     model = build_model(cfg)
@@ -536,7 +522,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
     total_loss = 0.0
     total_samples = 0
 
-    # 统计当前客户端每个 expert 被激活多少次
     expert_counts = torch.zeros(
         num_experts,
         dtype=torch.long,
@@ -551,19 +536,22 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
             optimizer.zero_grad()
 
-            # return_info=True 会返回 router 的 top1 expert id 和 router_probs
             logits, info = model(images, return_info=True)
 
-            # 更新 expert 激活次数
-            update_expert_counts(
-                expert_counts=expert_counts,
-                top1_indices=info["top1_indices"],
+            # top2 时优先统计 topk_indices；
+            # top1 时也兼容旧的 top1_indices。
+            expert_indices = info.get(
+                "topk_indices",
+                info["top1_indices"],
             )
 
-            # 纯分类损失
+            update_expert_counts(
+                expert_counts=expert_counts,
+                expert_indices=expert_indices,
+            )
+
             ce_loss = criterion(logits, labels)
 
-            # router balance loss，默认不启用
             balance_loss = torch.tensor(
                 0.0,
                 device=device,
@@ -580,7 +568,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
                     info["router_probs"]
                 )
 
-            # 反向传播使用总 loss
             loss = ce_loss + router_balance_weight * balance_loss
 
             loss.backward()
@@ -588,9 +575,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
             batch_size = images.size(0)
 
-            # 注意：
-            # client_loss 仍然记录纯 CE loss，
-            # 不记录加了 balance_loss 的总 loss。
+            # client_loss 仍然记录纯 CE loss，不记录加了 balance_loss 的总 loss。
             total_loss += ce_loss.item() * batch_size
             total_samples += batch_size
 
@@ -755,9 +740,6 @@ def print_partition_summary(client_indices):
 def print_meta_alpha(alpha):
     """
     打印元网络输出的专家聚合权重。
-
-    alpha shape:
-        [num_experts, num_clients]
     """
 
     if alpha is None:
@@ -806,12 +788,13 @@ def main():
     # --------------------------------------------------------
     # 加载数据
     # --------------------------------------------------------
-    train_set, test_set = build_datasets(cfg)
+    train_set, test_set = run_without_file_logging(
+        build_datasets,
+        cfg,
+    )
 
     # --------------------------------------------------------
     # 从测试集划分 server validation set
-    #   server_val_set: 给元网络训练
-    #   final_test_set: 给最终测试
     # --------------------------------------------------------
     server_val_set, final_test_set = split_server_validation_from_test_set(
         test_set=test_set,
@@ -821,7 +804,6 @@ def main():
 
     # --------------------------------------------------------
     # 客户端训练数据使用完整 train_set
-    # 不再从 train_set 里划 server validation
     # --------------------------------------------------------
     dataset_cfg = cfg["dataset"]
 
@@ -915,6 +897,7 @@ def main():
     print(f"momentum          : {train_cfg.get('momentum', 0.9)}")
     print(f"weight_decay      : {train_cfg.get('weight_decay', 0.0005)}")
     print(f"router_balance_w  : {train_cfg.get('router_balance_weight', 0.0)}")
+    print(f"model.top_k       : {model_cfg.get('top_k', 1)}")
     print(f"non_expert_agg    : {non_expert_agg}")
     print(f"expert_agg        : {expert_agg}")
 
@@ -937,7 +920,6 @@ def main():
             for name, tensor in global_model.state_dict().items()
         }
 
-        # 固定顺序选择客户端，不随机
         selected_clients = list(range(clients_per_round))
 
         client_state_dicts = []
@@ -1013,11 +995,6 @@ def main():
                 f"acc={test_acc:.2f}% | "
                 f"best={best_acc:.2f}%"
             )
-
-            # 每轮都打印 alpha 会比较长。
-            # 如果你想看每个 expert 的聚合权重，就取消下面两行注释。
-            # alpha = meta_info.get("alpha", None)
-            # print_meta_alpha(alpha)
 
         else:
             print(

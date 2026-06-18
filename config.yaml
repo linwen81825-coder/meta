@@ -11,6 +11,7 @@ dataset:
 model:
   num_experts: 4
   expert_hidden_dim: 2048
+  top_k: 2
 
 train:
   rounds: 50

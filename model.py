@@ -4,9 +4,13 @@
 #
 # 功能：
 # 1. ResNet18 作为 backbone 提取图像特征
-# 2. Switch Router 根据特征为每个样本选择一个 expert
+# 2. Switch Router 根据特征为每个样本选择 top-k 个 expert
 # 3. 每个 expert 内部包含分类头，也就是 expert 直接输出 logits
 # 4. 所有参数都参与本地训练，不冻结 backbone
+#
+# 说明：
+#   top_k=1 时，就是原来的 hard top1 routing
+#   top_k=2 时，每个样本会选择两个 expert，两个 expert 的 logits 加权相加
 # ------------------------------------------------------------
 
 import torch
@@ -65,11 +69,17 @@ class SwitchMoEHead(nn.Module):
     Switch-MoE 分类头。
 
     它包含两部分：
-    1. router：决定每个样本走哪个 expert
+    1. router：决定每个样本走哪些 expert
     2. experts：多个 expert，每个 expert 都能独立分类
 
-    第一版使用 top-1 routing：
-        每个样本只选择一个 expert。
+    当前支持 top-k routing：
+        top_k=1：
+            每个样本只选择 1 个 expert，也就是原来的 hard top1。
+
+        top_k=2：
+            每个样本选择 2 个 expert。
+            两个 expert 都会参与输出，因此两个 expert 都能收到梯度。
+            这可以缓解 expert collapse。
     """
 
     def __init__(
@@ -78,11 +88,19 @@ class SwitchMoEHead(nn.Module):
         num_classes=10,
         num_experts=4,
         expert_hidden_dim=2048,
+        top_k=1,
     ):
         super().__init__()
 
         self.num_experts = num_experts
         self.num_classes = num_classes
+        self.top_k = top_k
+
+        if self.top_k < 1:
+            raise ValueError("top_k 必须 >= 1")
+
+        if self.top_k > self.num_experts:
+            raise ValueError("top_k 不能大于 num_experts")
 
         # router 是一个线性层
         # 输入 feature，输出每个 expert 的分数
@@ -122,17 +140,43 @@ class SwitchMoEHead(nn.Module):
         router_probs = F.softmax(router_logits, dim=-1)    # [B, num_experts]
 
         # ----------------------------------------------------
-        # 2. top-1 routing：每个样本选择概率最大的 expert
+        # 2. top-k routing：每个样本选择概率最大的 k 个 expert
         # ----------------------------------------------------
-        top1_probs, top1_indices = torch.max(router_probs, dim=-1)
-        # top1_probs:   [B]
-        # top1_indices: [B]
+        topk_probs, topk_indices = torch.topk(
+            router_probs,
+            k=self.top_k,
+            dim=-1,
+        )
+        # topk_probs:   [B, top_k]
+        # topk_indices: [B, top_k]
+
+        # ----------------------------------------------------
+        # 3. 对 top-k 概率重新归一化，得到 gate
+        # ----------------------------------------------------
+        # 例子：
+        #   原始 top2 概率是 [0.60, 0.20]
+        #   归一化后是 [0.75, 0.25]
+        #
+        # 这样被选中的 top-k expert 的 gate 加起来等于 1。
+        topk_gates = topk_probs / topk_probs.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        # 为了兼容原来的日志和统计逻辑，仍然保留 top1 信息
+        top1_probs = topk_probs[:, 0]        # [B]
+        top1_indices = topk_indices[:, 0]    # [B]
 
         batch_size = features.size(0)
         device = features.device
 
         # 创建最终输出 logits
-        # 每个样本只会由它被分配到的 expert 产生 logits
+        #
+        # top_k=1:
+        #   final_logits 只来自一个 expert
+        #
+        # top_k=2:
+        #   final_logits 来自两个 expert 的加权和
         final_logits = torch.zeros(
             batch_size,
             self.num_classes,
@@ -141,38 +185,45 @@ class SwitchMoEHead(nn.Module):
         )
 
         # ----------------------------------------------------
-        # 3. 按 expert 分组处理样本
+        # 4. 按 top-k 位置和 expert 分组处理样本
         # ----------------------------------------------------
-        for expert_id, expert in enumerate(self.experts):
-            # 找出当前 batch 中被分配给这个 expert 的样本
-            mask = top1_indices == expert_id
+        for k_id in range(self.top_k):
+            # 当前 top-k 位置选择的 expert id
+            selected_expert_ids = topk_indices[:, k_id]  # [B]
 
-            # 如果当前 expert 没有被任何样本选中，就跳过
-            if mask.sum() == 0:
-                continue
+            # 当前 top-k 位置对应的 gate
+            selected_gates = topk_gates[:, k_id]         # [B]
 
-            # 取出属于当前 expert 的样本特征
-            expert_features = features[mask]  # [N_e, feature_dim]
+            for expert_id, expert in enumerate(self.experts):
+                # 找出当前 top-k 位置中选择了这个 expert 的样本
+                mask = selected_expert_ids == expert_id
 
-            # 当前 expert 对这些样本进行分类
-            expert_logits = expert(expert_features)  # [N_e, num_classes]
+                # 如果当前 expert 没有被任何样本选中，就跳过
+                if mask.sum() == 0:
+                    continue
 
-            # 用 router 的 top1 概率作为 gate
-            #
-            # 这样写表示：
-            # expert 负责输出分类结果，
-            # router 的选择置信度影响最终 logits。
-            expert_gate = top1_probs[mask].unsqueeze(1)  # [N_e, 1]
-            expert_logits = expert_logits * expert_gate
+                # 取出属于当前 expert 的样本特征
+                expert_features = features[mask]  # [N_e, feature_dim]
 
-            # 把当前 expert 的输出放回 final_logits 对应位置
-            final_logits[mask] = expert_logits
+                # 当前 expert 对这些样本进行分类
+                expert_logits = expert(expert_features)  # [N_e, num_classes]
+
+                # 用 top-k gate 加权
+                expert_gate = selected_gates[mask].unsqueeze(1)  # [N_e, 1]
+                expert_logits = expert_logits * expert_gate
+
+                # 注意这里是 +=
+                # 因为 top_k=2 时，一个样本会有两个 expert 输出，需要相加
+                final_logits[mask] += expert_logits
 
         if return_info:
             info = {
-                "router_probs": router_probs,       # 每个样本对每个 expert 的概率
-                "top1_probs": top1_probs,           # 每个样本被选中 expert 的概率
-                "top1_indices": top1_indices,       # 每个样本选择的 expert id
+                "router_probs": router_probs,       # [B, num_experts]
+                "top1_probs": top1_probs,           # [B]
+                "top1_indices": top1_indices,       # [B]
+                "topk_probs": topk_probs,           # [B, top_k]
+                "topk_gates": topk_gates,           # [B, top_k]
+                "topk_indices": topk_indices,       # [B, top_k]
             }
             return final_logits, info
 
@@ -206,6 +257,7 @@ class ResNet18SwitchMoE(nn.Module):
         num_classes=10,
         num_experts=4,
         expert_hidden_dim=2048,
+        top_k=1,
     ):
         super().__init__()
 
@@ -244,6 +296,7 @@ class ResNet18SwitchMoE(nn.Module):
             num_classes=num_classes,
             num_experts=num_experts,
             expert_hidden_dim=expert_hidden_dim,
+            top_k=top_k,
         )
 
     def forward(self, x, return_info=False):
@@ -333,6 +386,7 @@ if __name__ == "__main__":
         num_classes=10,
         num_experts=4,
         expert_hidden_dim=2048,
+        top_k=2,
     )
 
     # 打印可训练参数统计
@@ -347,3 +401,5 @@ if __name__ == "__main__":
     print("logits shape:", logits.shape)
     print("top1 expert indices:", info["top1_indices"])
     print("top1 gate probs:", info["top1_probs"])
+    print("topk expert indices:", info["topk_indices"])
+    print("topk gate probs:", info["topk_gates"])
