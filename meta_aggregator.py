@@ -221,6 +221,7 @@ class MetaExpertAggregator:
         lr=1e-3,
         meta_steps=1,
         max_val_batches=4,
+        train_log_path=None,
     ):
         self.num_experts = num_experts
         self.device = device
@@ -243,15 +244,18 @@ class MetaExpertAggregator:
         # 只用于写日志，不影响训练。
         self.round_id = 0
 
-        # 统一写入原本的训练日志文件。
-        # 注意：
-        #   这里直接 open 文件写入，不使用 print，
-        #   所以控制台不会显示这些详细内容。
-        self.train_log_path = os.path.join(
-            "./data",
-            "logs",
-            "train.log",
-        )
+    # 统一写入当前实验的训练日志文件。
+    # 这个路径由 train.py 传进来，不能写死。
+    # 例如：
+    #   ./data/meta2/logs/train.log
+    #
+    # 注意：
+    #   这里直接 open 文件写入，不使用 print，
+    #   所以控制台不会显示这些详细内容。
+    if train_log_path is None:
+        raise ValueError("MetaExpertAggregator 必须传入 train_log_path，不能使用写死日志路径。")
+
+    self.train_log_path = train_log_path
 
     # --------------------------------------------------------
     # 5.1 构造元网络输入特征

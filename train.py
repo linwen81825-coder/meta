@@ -715,7 +715,7 @@ def main():
 
     cfg = load_config(args.config)
 
-    setup_logging(cfg)
+    log_path = setup_logging(cfg)
 
     print(f"配置文件路径: {args.config}")
 
@@ -818,6 +818,7 @@ def main():
             lr=meta_cfg.get("lr", 1e-3),
             meta_steps=meta_cfg.get("steps", 1),
             max_val_batches=meta_cfg.get("max_val_batches", 4),
+            train_log_path=log_path,
         )
 
         print("已启用 expert_agg = meta_network")
