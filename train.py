@@ -11,6 +11,7 @@
 #    - expert 参数使用 expert_agg
 #    - non-expert 参数使用 non_expert_agg
 # 6. 每轮测试全局模型准确率
+# 7. 自动保存训练日志到 dataset.data_root/logs/train.log
 #
 # 当前只支持两种聚合方式：
 #   - uniform：每个客户端权重相同
@@ -18,9 +19,10 @@
 # ------------------------------------------------------------
 
 import argparse
-import copy
 import os
 import random
+import sys
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -32,6 +34,90 @@ from torchvision import datasets, transforms
 
 # 从 model.py 中导入模型和专家参数判断函数
 from model import ResNet18SwitchMoE, is_expert_param, print_trainable_param_stats
+
+
+# ------------------------------------------------------------
+# 0. 日志工具：同时打印到终端和保存到文件
+# ------------------------------------------------------------
+class TeeLogger:
+    """
+    一个简单的日志分流器。
+
+    作用：
+        把 print() 的内容同时输出到：
+        1. 终端
+        2. 日志文件
+
+    这样你不用再手动写：
+        python train.py | tee train.log
+
+    代码里所有 print() 都会自动保存。
+    """
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, message):
+        """
+        print() 输出时会自动调用 write()。
+        """
+        self.terminal.write(message)
+        self.log_file.write(message)
+
+        # 及时刷新，防止训练中断时日志没写进去
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def flush(self):
+        """
+        兼容 Python 的输出刷新机制。
+        """
+        self.terminal.flush()
+        self.log_file.flush()
+
+
+def get_log_path(cfg):
+    """
+    根据 dataset.data_root 自动生成日志保存路径。
+
+    例如：
+        data_root: ./data
+
+    日志路径就是：
+        ./data/logs/train.log
+    """
+
+    data_root = cfg["dataset"].get("data_root", "./data")
+    log_dir = os.path.join(data_root, "logs")
+
+    os.makedirs(log_dir, exist_ok=True)
+
+    return os.path.join(log_dir, "train.log")
+
+
+def setup_logging(cfg):
+    """
+    开启自动日志保存。
+
+    所有 print() 内容都会同时输出到终端和日志文件。
+    """
+
+    log_path = get_log_path(cfg)
+
+    # 追加模式：不会覆盖之前的日志
+    log_file = open(log_path, "a", encoding="utf-8")
+
+    # 保存原始 stdout/stderr，并把它们替换成 TeeLogger
+    sys.stdout = TeeLogger(sys.__stdout__, log_file)
+    sys.stderr = TeeLogger(sys.__stderr__, log_file)
+
+    print("\n" + "=" * 80)
+    print(f"日志开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"日志保存路径: {log_path}")
+    print("=" * 80)
+
+    return log_path
 
 
 # ------------------------------------------------------------
@@ -520,6 +606,7 @@ def print_partition_summary(client_indices):
     打印每个客户端有多少样本。
 
     这个函数只是帮助你确认划分是否正常。
+    因为已经开启了 TeeLogger，所以这里的 print 也会自动写入日志。
     """
 
     print("========== 客户端数据划分 ==========")
@@ -548,9 +635,16 @@ def main():
     # 读取配置
     cfg = load_config(args.config)
 
+    # 开启自动日志保存
+    # 注意：这行之后，后面所有 print 都会同时写入日志文件。
+    setup_logging(cfg)
+
+    print(f"配置文件路径: {args.config}")
+
     # 固定随机种子
     seed = cfg.get("seed", 1)
     set_seed(seed)
+    print(f"随机种子: {seed}")
 
     # 选择设备
     device = get_device(cfg)
@@ -591,6 +685,7 @@ def main():
     global_model.to(device)
 
     # 打印参数统计
+    # 因为已经开启了 TeeLogger，这里的输出也会自动保存到日志。
     print_trainable_param_stats(global_model)
 
     train_cfg = cfg["train"]
@@ -602,6 +697,19 @@ def main():
         raise ValueError("clients_per_round 不能大于 num_clients")
 
     best_acc = 0.0
+
+    print("========== 训练配置 ==========")
+    print(f"rounds            : {rounds}")
+    print(f"num_clients       : {num_clients}")
+    print(f"clients_per_round : {clients_per_round}")
+    print(f"local_epochs      : {train_cfg['local_epochs']}")
+    print(f"batch_size        : {train_cfg['batch_size']}")
+    print(f"lr                : {train_cfg['lr']}")
+    print(f"momentum          : {train_cfg.get('momentum', 0.9)}")
+    print(f"weight_decay      : {train_cfg.get('weight_decay', 0.0005)}")
+    print(f"non_expert_agg    : {cfg['aggregation']['non_expert_agg']}")
+    print(f"expert_agg        : {cfg['aggregation']['expert_agg']}")
+    print("==============================")
 
     # --------------------------------------------------------
     # FL 主循环
@@ -673,6 +781,11 @@ def main():
             f"acc={test_acc:.2f}% | "
             f"best={best_acc:.2f}%"
         )
+
+    print("=" * 80)
+    print(f"训练结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"最终 best_acc: {best_acc:.2f}%")
+    print("=" * 80)
 
 
 # ------------------------------------------------------------
