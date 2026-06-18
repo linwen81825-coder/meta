@@ -721,13 +721,11 @@ def main():
             for name, tensor in global_model.state_dict().items()
         }
 
-        # 每轮选择客户端
-        # 第一版如果 clients_per_round = num_clients，就是全客户端参与
-        rng = random.Random(seed + round_id)
-        selected_clients = rng.sample(
-            range(num_clients),
-            clients_per_round,
-        )
+        # 每轮固定按顺序选择客户端，不再随机选择
+        # 例如：
+        #   num_clients=10, clients_per_round=10 时，每轮都是 client 0~9 全部参与
+        #   num_clients=10, clients_per_round=5 时，每轮固定使用 client 0~4
+        selected_clients = list(range(clients_per_round))
 
         client_state_dicts = []
         client_num_samples = []
@@ -775,7 +773,6 @@ def main():
 
         print(
             f"Round {round_id:03d} | "
-            f"clients={selected_clients} | "
             f"client_loss={avg_client_loss:.4f} | "
             f"test_loss={test_loss:.4f} | "
             f"acc={test_acc:.2f}% | "

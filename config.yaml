@@ -14,7 +14,6 @@ model:
 
 train:
   rounds: 50
-  clients_per_round: 10
   local_epochs: 1
   batch_size: 64
   lr: 0.01
