@@ -1,0 +1,10 @@
+# 默认忽略所有文件
+*
+
+# 允许上传 .gitignore 本身
+!.gitignore
+
+# 只允许上传这三个文件
+!config.yaml
+!model.py
+!train.py

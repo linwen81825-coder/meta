@@ -1,0 +1,29 @@
+seed: 1
+device: cuda
+
+dataset:
+  name: cifar10
+  data_root: ./data
+  num_classes: 10
+  num_clients: 10
+  alpha: 0.1
+
+model:
+  num_experts: 4
+  expert_hidden_dim: 2048
+
+train:
+  rounds: 50
+  clients_per_round: 10
+  local_epochs: 1
+  batch_size: 64
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.0005
+  test_batch_size: 256
+  num_workers: 2
+
+aggregation:
+  #uniform/sample_weighted
+  non_expert_agg: sample_weighted
+  expert_agg: sample_weighted
