@@ -365,6 +365,14 @@ class MetaExpertAggregator:
                 shape: [num_experts, num_clients]
         """
 
+        # 确保 alpha 和要聚合的参数在同一个 device 上。
+        # meta 更新阶段 device 一般是 cuda；
+        # 最终返回 state_dict 阶段 device 一般是 cpu。
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+
+        alpha = alpha.to(device)
+
         non_expert_weights = get_basic_weights(
             method=non_expert_agg,
             client_num_samples=client_num_samples,

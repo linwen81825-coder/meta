@@ -18,7 +18,7 @@
 #   - sample_weighted：按客户端样本数加权
 
 # 新增功能：
-# 1. 从训练集划分 server validation set
+# 1. 从测试集划分 server validation set
 # 2. 客户端本地训练时统计：
 #    - client_loss
 #    - expert_activation_frequency
@@ -220,27 +220,26 @@ def build_datasets(cfg):
 
 
 # ------------------------------------------------------------
-# 6. 从训练集划分 server validation set
+# 6. 从测试集划分 class-balanced server validation set
 # ------------------------------------------------------------
-# ------------------------------------------------------------
-# 6. 从训练集划分 class-balanced server validation set
-# ------------------------------------------------------------
-def split_server_validation_set(train_set, cfg, seed):
+def split_server_validation_from_test_set(test_set, cfg, seed):
     """
-    从 CIFAR10 训练集中划出服务器验证集。
+    从 CIFAR10 测试集中划出服务器验证集。
+
+    当前数据流：
+        train_set 全部用于客户端训练；
+        test_set 先划出 server validation set；
+        剩下的 test_set 用于最终测试。
 
     默认做 class-balanced 划分：
-
         server.val_size = 1000
         num_classes = 10
 
     那么每类取：
-
         1000 / 10 = 100 张
 
     作为 server validation set。
-
-    剩下的训练样本再给客户端做 Dirichlet non-IID 划分。
+    剩下的测试样本作为 final test set。
     """
 
     server_cfg = cfg.get("server", {})
@@ -249,16 +248,21 @@ def split_server_validation_set(train_set, cfg, seed):
     val_size = server_cfg.get("val_size", 1000)
     num_classes = dataset_cfg["num_classes"]
 
-    total_size = len(train_set)
+    total_size = len(test_set)
 
     if val_size <= 0:
-        client_train_set = train_set
-        client_train_labels = train_set.targets
         server_val_set = None
-        return client_train_set, client_train_labels, server_val_set
+        final_test_set = test_set
+
+        print("========== Server 验证集划分 ==========")
+        print("server.val_size <= 0，不划分 server validation set")
+        print(f"final test samples: {len(final_test_set)}")
+        print("======================================")
+
+        return server_val_set, final_test_set
 
     if val_size >= total_size:
-        raise ValueError("server.val_size 不能大于等于训练集大小")
+        raise ValueError("server.val_size 不能大于等于测试集大小")
 
     if val_size % num_classes != 0:
         raise ValueError(
@@ -269,12 +273,12 @@ def split_server_validation_set(train_set, cfg, seed):
     samples_per_class = val_size // num_classes
 
     rng = np.random.default_rng(seed)
-    labels = np.array(train_set.targets)
+    labels = np.array(test_set.targets)
 
     server_val_indices = []
-    client_train_indices = []
+    final_test_indices = []
 
-    # 逐类抽样，保证每个类别数量一样
+    # 逐类抽样，保证 server validation 每个类别数量一样
     for class_id in range(num_classes):
         class_indices = np.where(labels == class_id)[0]
         rng.shuffle(class_indices)
@@ -282,31 +286,26 @@ def split_server_validation_set(train_set, cfg, seed):
         # 当前类别前 samples_per_class 张给 server validation
         class_val_indices = class_indices[:samples_per_class]
 
-        # 当前类别剩下的给客户端训练
-        class_client_indices = class_indices[samples_per_class:]
+        # 当前类别剩下的给最终测试
+        class_test_indices = class_indices[samples_per_class:]
 
         server_val_indices.extend(class_val_indices.tolist())
-        client_train_indices.extend(class_client_indices.tolist())
+        final_test_indices.extend(class_test_indices.tolist())
 
-    # 打乱最终顺序
     rng.shuffle(server_val_indices)
-    rng.shuffle(client_train_indices)
+    rng.shuffle(final_test_indices)
 
-    server_val_set = Subset(train_set, server_val_indices)
-    client_train_set = Subset(train_set, client_train_indices)
-
-    client_train_labels = [
-        train_set.targets[idx]
-        for idx in client_train_indices
-    ]
+    server_val_set = Subset(test_set, server_val_indices)
+    final_test_set = Subset(test_set, final_test_indices)
 
     print("========== Server 验证集划分 ==========")
+    print("划分来源: CIFAR10 test set")
     print(f"server val samples       : {len(server_val_set)}")
-    print(f"client train samples     : {len(client_train_set)}")
+    print(f"final test samples       : {len(final_test_set)}")
     print(f"server val per class     : {samples_per_class}")
     print("======================================")
 
-    return client_train_set, client_train_labels, server_val_set
+    return server_val_set, final_test_set
 
 
 # ------------------------------------------------------------
@@ -316,8 +315,8 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
     """
     用 Dirichlet 分布划分 non-IID 客户端数据。
 
-    输入的 labels 是 client_train_set 的标签。
-    返回的 client_indices 是相对于 client_train_set 的索引。
+    输入的 labels 是完整 train_set 的标签。
+    返回的 client_indices 是相对于 train_set 的索引。
     """
 
     rng = np.random.default_rng(seed)
@@ -358,7 +357,7 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
 # ------------------------------------------------------------
 # 8. 构建每个客户端的 DataLoader
 # ------------------------------------------------------------
-def build_client_loaders(client_train_set, client_indices, cfg, device):
+def build_client_loaders(train_set, client_indices, cfg, device):
     """
     根据客户端样本索引，构建每个客户端自己的 DataLoader。
     """
@@ -372,7 +371,7 @@ def build_client_loaders(client_train_set, client_indices, cfg, device):
     client_loaders = []
 
     for indices in client_indices:
-        client_dataset = Subset(client_train_set, indices)
+        client_dataset = Subset(train_set, indices)
 
         loader = DataLoader(
             client_dataset,
@@ -732,18 +731,25 @@ def main():
     # --------------------------------------------------------
     train_set, test_set = build_datasets(cfg)
 
-    # 先从训练集划出 server validation set
-    client_train_set, client_train_labels, server_val_set = split_server_validation_set(
-        train_set=train_set,
+    # --------------------------------------------------------
+    # 从测试集划分 server validation set
+    #   server_val_set: 给元网络训练
+    #   final_test_set: 给最终测试
+    # --------------------------------------------------------
+    server_val_set, final_test_set = split_server_validation_from_test_set(
+        test_set=test_set,
         cfg=cfg,
         seed=seed,
     )
 
-    # 用剩余训练集划分客户端
+    # --------------------------------------------------------
+    # 客户端训练数据使用完整 train_set
+    # 不再从 train_set 里划 server validation
+    # --------------------------------------------------------
     dataset_cfg = cfg["dataset"]
 
     client_indices = dirichlet_partition(
-        labels=client_train_labels,
+        labels=train_set.targets,
         num_clients=dataset_cfg["num_clients"],
         alpha=dataset_cfg["alpha"],
         seed=seed,
@@ -752,7 +758,7 @@ def main():
     print_partition_summary(client_indices)
 
     client_loaders = build_client_loaders(
-        client_train_set=client_train_set,
+        train_set=train_set,
         client_indices=client_indices,
         cfg=cfg,
         device=device,
@@ -765,7 +771,7 @@ def main():
     )
 
     test_loader = build_test_loader(
-        test_set=test_set,
+        test_set=final_test_set,
         cfg=cfg,
         device=device,
     )
