@@ -904,10 +904,17 @@ def main():
     if expert_agg == "meta_network":
         meta_cfg = cfg.get("meta", {})
         print("---------- Meta 配置 ----------")
-        print(f"meta.hidden_dim    : {meta_cfg.get('hidden_dim', 32)}")
-        print(f"meta.lr            : {meta_cfg.get('lr', 1e-3)}")
-        print(f"meta.steps         : {meta_cfg.get('steps', 1)}")
-        print(f"max_val_batches    : {meta_cfg.get('max_val_batches', 4)}")
+        print(f"meta.hidden_dim     : {meta_cfg.get('hidden_dim', 32)}")
+        print(f"meta.lr             : {meta_cfg.get('lr', 1e-3)}")
+        print(f"meta.steps          : {meta_cfg.get('steps', 1)}")
+        print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
+
+    # 打印元网络实际输入特征，方便后续做 ablation 对比。
+    # 例如：
+    #   [loss_z, expert_freq]
+    if meta_aggregator is not None:
+        input_features = ", ".join(meta_aggregator.input_feature_names)
+        print(f"meta.input_features : [{input_features}]")
 
     print("==============================")
 

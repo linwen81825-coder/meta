@@ -6,7 +6,7 @@
 #   用服务器验证集训练一个元网络，让它输出 expert 聚合权重。
 #
 # 算法流程：
-#   客户端统计特征 [client_loss_z, sample_ratio, expert_activation_frequency]
+#   客户端统计特征 [client_loss_z, expert_activation_frequency]
 #       ↓
 #   元网络输出每个 expert 的客户端聚合权重 alpha
 #       ↓
@@ -24,18 +24,18 @@
 #   元网络输入、最终聚合权重、元网络诊断信息都会追加写入当前实验的 train.log。
 #   日志路径由 train.py 传进来，不能写死。
 #
-# 新增诊断：
-#   1. score_std:
-#       元网络 softmax 前 score 的标准差。
-#       如果很小，说明不同 client-expert 的 score 没拉开。
+# 当前版本：
+#   已删除 sample_ratio 作为元网络输入。
 #
-#   2. alpha_entropy:
-#       alpha 的归一化熵，范围大约 0~1。
-#       越接近 1，说明 alpha 越接近 uniform。
+#   元网络输入变为：
+#       [loss_z, expert_freq]
 #
-#   3. meta_grad_norm:
-#       元网络参数梯度范数。
-#       如果很小，说明 validation loss 几乎推不动元网络。
+#   其中：
+#       loss_z:
+#           当前客户端训练 loss 在本轮客户端中的相对高低。
+#
+#       expert_freq:
+#           当前客户端上当前 expert 的激活频率。
 #
 # 注意：
 #   这里不能用 model.load_state_dict() 做临时模型。
@@ -168,9 +168,9 @@ class MetaWeightNet(nn.Module):
     """
     元网络。
 
-    对每一个 client-expert pair 输入三个统计特征：
+    对每一个 client-expert pair 输入两个统计特征：
 
-        [client_loss_z, sample_ratio, expert_activation_frequency]
+        [client_loss_z, expert_activation_frequency]
 
     输出一个 score。
 
@@ -178,13 +178,13 @@ class MetaWeightNet(nn.Module):
     得到这个 expert 的客户端聚合权重 alpha。
 
     输入维度：
-        3
+        2
 
     输出维度：
         1
     """
 
-    def __init__(self, input_dim=3, hidden_dim=32):
+    def __init__(self, input_dim=2, hidden_dim=32):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -196,7 +196,7 @@ class MetaWeightNet(nn.Module):
     def forward(self, x):
         """
         x:
-            shape: [N, 3]
+            shape: [N, 2]
 
         return:
             score:
@@ -238,10 +238,10 @@ class MetaExpertAggregator:
         self.meta_steps = meta_steps
         self.max_val_batches = max_val_batches
 
-        # 现在元网络输入是 3 维：
-        # [loss_z, sample_ratio, expert_freq]
+        # 现在元网络输入是 2 维：
+        # [loss_z, expert_freq]
         self.meta_net = MetaWeightNet(
-            input_dim=3,
+            input_dim=2,
             hidden_dim=hidden_dim,
         ).to(device)
 
@@ -253,6 +253,15 @@ class MetaExpertAggregator:
         # 当前是第几轮聚合。
         # 只用于写日志，不影响训练。
         self.round_id = 0
+        # 当前元网络实际使用的输入特征。
+        # 注意：
+        #   这里要和 build_meta_features() 里 stack 的顺序保持一致。
+        #   当前版本已经删除 sample_ratio，所以只剩：
+        #       [loss_z, expert_freq]
+        self.input_feature_names = [
+            "loss_z",
+            "expert_freq",
+        ]
 
         # 统一写入当前实验的训练日志文件。
         # 这个路径由 train.py 传进来，不能写死。
@@ -288,13 +297,22 @@ class MetaExpertAggregator:
                 list 或 tensor
                 shape: [num_clients]
 
+                注意：
+                    当前版本不再把 sample_ratio 作为元网络输入。
+                    这里保留 client_num_samples 参数，是为了兼容 aggregate()
+                    的调用接口，避免 train.py 也跟着改。
+
         输出：
             features:
-                shape: [num_experts, num_clients, 3]
+                shape: [num_experts, num_clients, 2]
 
         其中每个 feature 是：
-            [loss_z, sample_ratio, expert_activation_frequency]
+            [loss_z, expert_activation_frequency]
         """
+
+        # 保留这个变量只是为了说明：
+        # 当前版本 client_num_samples 不参与元网络输入。
+        _ = client_num_samples
 
         # ----------------------------------------------------
         # 1. client loss -> loss_z
@@ -332,33 +350,19 @@ class MetaExpertAggregator:
             )
 
         # ----------------------------------------------------
-        # 3. sample ratio
+        # 3. 拼接成 [E, C, 2]
         # ----------------------------------------------------
-        sample_counts = torch.as_tensor(
-            client_num_samples,
-            dtype=torch.float32,
-            device=self.device,
-        )
 
-        if sample_counts.numel() != num_clients:
-            raise ValueError(
-                f"client_num_samples 数量不一致: "
-                f"num_samples={sample_counts.numel()}, num_clients={num_clients}"
-            )
-
-        sample_ratio = sample_counts / sample_counts.sum().clamp_min(1e-6)
-
-        # ----------------------------------------------------
-        # 4. 拼接成 [E, C, 3]
-        # ----------------------------------------------------
+        # loss_z: [C] -> [E, C]
         loss_feature = loss_z.unsqueeze(0).expand(num_experts, num_clients)
-        sample_feature = sample_ratio.unsqueeze(0).expand(num_experts, num_clients)
+
+        # expert_freqs: [C, E] -> [E, C]
         freq_feature = expert_freqs.transpose(0, 1)
 
+        # features: [E, C, 2]
         features = torch.stack(
             [
                 loss_feature,
-                sample_feature,
                 freq_feature,
             ],
             dim=-1,
@@ -474,6 +478,15 @@ class MetaExpertAggregator:
     ):
         """
         记录元网络输入特征到当前实验 train.log。
+
+        当前版本记录：
+            loss_z
+            expert_freq
+            raw_client_loss
+            client_num_samples
+
+        注意：
+            sample_ratio 已经不再作为元网络输入，所以这里不再记录 sample_ratio。
         """
 
         os.makedirs(
@@ -507,8 +520,7 @@ class MetaExpertAggregator:
             for expert_id in range(num_experts):
                 for client_id in range(num_clients):
                     loss_z = features[expert_id, client_id, 0].item()
-                    sample_ratio = features[expert_id, client_id, 1].item()
-                    expert_freq = features[expert_id, client_id, 2].item()
+                    expert_freq = features[expert_id, client_id, 1].item()
                     raw_loss = raw_losses[client_id].item()
                     num_samples = sample_counts[client_id].item()
 
@@ -518,7 +530,6 @@ class MetaExpertAggregator:
                         f"expert={expert_id} "
                         f"client={client_id} "
                         f"loss_z={loss_z:.8f} "
-                        f"sample_ratio={sample_ratio:.8f} "
                         f"expert_freq={expert_freq:.8f} "
                         f"raw_client_loss={raw_loss:.8f} "
                         f"client_num_samples={num_samples:.0f}\n"
@@ -536,6 +547,11 @@ class MetaExpertAggregator:
     ):
         """
         记录元网络最终输出的 expert 聚合权重到当前实验 train.log。
+
+        注意：
+            虽然 sample_ratio 不再作为元网络输入，
+            但是这里仍然记录 sample_weighted_weight，
+            方便你对比 meta alpha 是否还会偏向大客户端。
         """
 
         os.makedirs(
