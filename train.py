@@ -878,6 +878,21 @@ def main():
             meta_steps=meta_cfg.get("steps", 1),
             max_val_batches=meta_cfg.get("max_val_batches", 4),
             train_log_path=log_path,
+
+            # 元网络输入特征由 config.yaml 控制。
+            # 当前支持：
+            #   loss_z
+            #   sample_ratio
+            #   expert_freq
+            #   delta_norm_z
+            input_features=meta_cfg.get(
+                "input_features",
+                [
+                    "loss_z",
+                    "sample_ratio",
+                    "expert_freq",
+                ],
+            ),
         )
 
         print("已启用 expert_agg = meta_network")
@@ -908,6 +923,11 @@ def main():
         print(f"meta.lr             : {meta_cfg.get('lr', 1e-3)}")
         print(f"meta.steps          : {meta_cfg.get('steps', 1)}")
         print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
+
+        # 打印元网络实际输入特征，方便做消融实验。
+        if meta_aggregator is not None:
+            input_features = ", ".join(meta_aggregator.input_feature_names)
+            print(f"meta.input_features : [{input_features}]")
 
     # 打印元网络实际输入特征，方便后续做 ablation 对比。
     # 例如：

@@ -34,7 +34,12 @@ meta:
   lr: 0.001
   steps: 1
   max_val_batches: 4
-
+  input_features:
+    - loss_z
+    - sample_ratio
+    - expert_freq
+    - delta_norm_z
+    
 aggregation:
   # non_expert_agg 支持：uniform / sample_weighted
   non_expert_agg: sample_weighted
