@@ -6,12 +6,13 @@
 #
 # meta:
 #   tau: 0.5
+#   active_mask: true
+#   active_threshold: 0.0
+#   min_active_clients_per_expert: 2
 #   input_features:
-#     - loss_z
-#     - sample_ratio
 #     - expert_freq
-#     - expert_loss_z
 #     - delta_norm_z
+#     - expert_loss_z
 #
 # 当前支持五个输入特征：
 #   loss_z:
@@ -34,14 +35,13 @@
 #       softmax 温度系数。
 #       alpha = softmax(scores / tau)
 #
-#       tau < 1:
-#           alpha 更尖锐，客户端权重区分度更大。
+#   active_mask:
+#       是否只让激活过 expert 的客户端参与该 expert 的 softmax。
 #
-#       tau = 1:
-#           普通 softmax。
-#
-#       tau > 1:
-#           alpha 更平滑，更接近 uniform。
+#   min_active_clients_per_expert:
+#       最小活跃客户端数。
+#       如果某个 expert 的活跃客户端数量小于该值，
+#       则该 expert 退回所有客户端参与 softmax，避免单客户端主导。
 # ------------------------------------------------------------
 
 import os
@@ -217,6 +217,9 @@ class MetaExpertAggregator:
         train_log_path=None,
         input_features=None,
         tau=1.0,
+        active_mask=False,
+        active_threshold=0.0,
+        min_active_clients_per_expert=2,
     ):
         self.num_experts = num_experts
         self.device = device
@@ -227,6 +230,17 @@ class MetaExpertAggregator:
             raise ValueError(f"meta.tau 必须大于 0，当前 tau={tau}")
 
         self.tau = float(tau)
+
+        self.active_mask = bool(active_mask)
+        self.active_threshold = float(active_threshold)
+
+        if min_active_clients_per_expert < 1:
+            raise ValueError(
+                "min_active_clients_per_expert 必须 >= 1，"
+                f"当前值为 {min_active_clients_per_expert}"
+            )
+
+        self.min_active_clients_per_expert = int(min_active_clients_per_expert)
 
         if input_features is None:
             input_features = [
@@ -680,7 +694,82 @@ class MetaExpertAggregator:
         return features
 
     # --------------------------------------------------------
-    # 5.9 计算 alpha 诊断信息
+    # 5.9 根据 expert_freq 构造 active mask
+    # --------------------------------------------------------
+    def build_active_mask(
+        self,
+        client_expert_freqs,
+        num_clients,
+    ):
+        """
+        构造 active mask。
+
+        输入：
+            client_expert_freqs:
+                shape = [num_clients, num_experts]
+
+        输出：
+            active_mask:
+                shape = [num_experts, num_clients]
+
+        逻辑：
+            active_mask[e, i] = True:
+                client i 的 expert e 被激活过，参与该 expert 的 softmax。
+
+            active_mask[e, i] = False:
+                client i 的 expert e 未激活，不参与该 expert 的 softmax。
+
+        保护机制：
+            如果某个 expert 的 active client 数量小于
+            self.min_active_clients_per_expert，
+            则该 expert 退回所有客户端参与 softmax，
+            避免单个客户端完全主导该 expert。
+        """
+
+        expert_freqs = torch.as_tensor(
+            client_expert_freqs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if expert_freqs.dim() != 2:
+            raise ValueError(
+                "client_expert_freqs 应该是二维，shape=[num_clients, num_experts]"
+            )
+
+        input_num_clients, input_num_experts = expert_freqs.shape
+
+        if input_num_clients != num_clients:
+            raise ValueError(
+                f"client_expert_freqs 客户端数量不一致: "
+                f"freq_clients={input_num_clients}, num_clients={num_clients}"
+            )
+
+        if input_num_experts != self.num_experts:
+            raise ValueError(
+                f"expert 数量不一致: 当前 num_experts={self.num_experts}, "
+                f"但是输入 expert_freqs.shape={expert_freqs.shape}"
+            )
+
+        expert_freq_feature = expert_freqs.transpose(0, 1)
+
+        active_mask = expert_freq_feature > self.active_threshold
+
+        active_count = active_mask.sum(dim=1, keepdim=True)
+
+        too_few_active = active_count < self.min_active_clients_per_expert
+
+        if too_few_active.any():
+            active_mask = torch.where(
+                too_few_active,
+                torch.ones_like(active_mask, dtype=torch.bool),
+                active_mask,
+            )
+
+        return active_mask
+
+    # --------------------------------------------------------
+    # 5.10 计算 alpha 诊断信息
     # --------------------------------------------------------
     def compute_alpha_stats(self, scores, alpha):
         """
@@ -723,7 +812,7 @@ class MetaExpertAggregator:
         return stats
 
     # --------------------------------------------------------
-    # 5.10 计算元网络梯度范数
+    # 5.11 计算元网络梯度范数
     # --------------------------------------------------------
     def compute_meta_grad_norm(self):
         """
@@ -749,7 +838,7 @@ class MetaExpertAggregator:
         return grad_norm, grad_max_abs
 
     # --------------------------------------------------------
-    # 5.11 把元网络输入写入 train.log，不打印到控制台
+    # 5.12 把元网络输入写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_inputs(
         self,
@@ -806,7 +895,7 @@ class MetaExpertAggregator:
             f.write(f"[META_INPUT_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.12 把最终聚合权重 alpha 写入 train.log，不打印到控制台
+    # 5.13 把最终聚合权重 alpha 写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_alpha(
         self,
@@ -851,7 +940,7 @@ class MetaExpertAggregator:
             f.write(f"[META_ALPHA_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.13 记录 meta 训练诊断信息
+    # 5.14 记录 meta 训练诊断信息
     # --------------------------------------------------------
     def log_meta_diagnostics(
         self,
@@ -887,7 +976,7 @@ class MetaExpertAggregator:
             )
 
     # --------------------------------------------------------
-    # 5.14 记录最终 alpha 的诊断信息
+    # 5.15 记录最终 alpha 的诊断信息
     # --------------------------------------------------------
     def log_meta_final_diagnostics(self, alpha_stats):
         """
@@ -912,7 +1001,7 @@ class MetaExpertAggregator:
             )
 
     # --------------------------------------------------------
-    # 5.15 元网络输出 alpha
+    # 5.16 元网络输出 alpha
     # --------------------------------------------------------
     def compute_alpha(
         self,
@@ -945,7 +1034,20 @@ class MetaExpertAggregator:
 
         scores = flat_scores.reshape(num_experts, num_clients)
 
-        alpha = F.softmax(scores / self.tau, dim=1)
+        if self.active_mask:
+            active_mask = self.build_active_mask(
+                client_expert_freqs=client_expert_freqs,
+                num_clients=num_clients,
+            )
+
+            scores_for_softmax = scores.masked_fill(
+                ~active_mask,
+                -1e9,
+            )
+        else:
+            scores_for_softmax = scores
+
+        alpha = F.softmax(scores_for_softmax / self.tau, dim=1)
 
         if return_stats:
             stats = self.compute_alpha_stats(
@@ -958,7 +1060,7 @@ class MetaExpertAggregator:
         return alpha
 
     # --------------------------------------------------------
-    # 5.16 根据 alpha 构造聚合后的 state_dict
+    # 5.17 根据 alpha 构造聚合后的 state_dict
     # --------------------------------------------------------
     def build_aggregated_state_dict(
         self,
@@ -1036,7 +1138,7 @@ class MetaExpertAggregator:
         return new_state_dict
 
     # --------------------------------------------------------
-    # 5.17 在 server validation set 上计算 CE loss
+    # 5.18 在 server validation set 上计算 CE loss
     # --------------------------------------------------------
     def compute_validation_loss(self, model, temp_state_dict, val_loader):
         """
@@ -1077,7 +1179,7 @@ class MetaExpertAggregator:
         return avg_loss
 
     # --------------------------------------------------------
-    # 5.18 主函数：更新元网络并返回最终聚合模型
+    # 5.19 主函数：更新元网络并返回最终聚合模型
     # --------------------------------------------------------
     def aggregate(
         self,

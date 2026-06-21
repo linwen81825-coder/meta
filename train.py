@@ -16,7 +16,7 @@
 # 5. 支持 top-k routing，其中 top_k 从 config.yaml 的 model.top_k 读取
 # 6. 元网络输入特征由 meta.input_features 控制
 # 7. 支持 meta.tau，控制 softmax 输出 alpha 的尖锐程度
-# 8. 每轮打印元网络输出的 expert 聚合权重
+# 8. 支持 active_mask，避免未激活 expert 的客户端参与该 expert 的权重归一化
 # ------------------------------------------------------------
 
 import argparse
@@ -447,11 +447,6 @@ def build_test_loader(test_set, cfg, device):
 def compute_router_balance_loss(router_probs):
     """
     计算 router balance loss，缓解 expert 激活塌缩。
-
-    注意：
-        这里必须用 router_probs 这种 soft probability。
-        不能用 top1_indices 算 loss，因为 top1_indices 是离散选择，
-        对 router 没有可用梯度。
     """
 
     if router_probs.dim() == 3:
@@ -766,9 +761,6 @@ def aggregate_state_dicts(
 ):
     """
     普通聚合函数。
-
-    当 expert_agg 是 uniform 或 sample_weighted 时使用这个函数。
-    如果 expert_agg = meta_network，不走这里，而是调用 MetaExpertAggregator。
     """
 
     agg_cfg = cfg["aggregation"]
@@ -829,7 +821,7 @@ def print_partition_summary(client_indices):
 
 
 # ------------------------------------------------------------
-# 18. 打印 meta alpha
+# 18. 主训练流程
 # ------------------------------------------------------------
 def print_meta_alpha(alpha):
     """
@@ -854,9 +846,8 @@ def print_meta_alpha(alpha):
     print("=======================================")
 
 
-# ------------------------------------------------------------
-# 19. 主训练流程
-# ------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -961,6 +952,12 @@ def main():
             max_val_batches=meta_cfg.get("max_val_batches", 4),
             train_log_path=log_path,
             tau=meta_cfg.get("tau", 1.0),
+            active_mask=meta_cfg.get("active_mask", False),
+            active_threshold=meta_cfg.get("active_threshold", 0.0),
+            min_active_clients_per_expert=meta_cfg.get(
+                "min_active_clients_per_expert",
+                2,
+            ),
             input_features=meta_cfg.get(
                 "input_features",
                 [
@@ -997,6 +994,12 @@ def main():
         print(f"meta.steps          : {meta_cfg.get('steps', 1)}")
         print(f"meta.tau            : {meta_cfg.get('tau', 1.0)}")
         print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
+        print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
+        print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
+        print(
+            "min_active_clients : "
+            f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
+        )
 
         if meta_aggregator is not None:
             input_features = ", ".join(meta_aggregator.input_feature_names)
@@ -1052,9 +1055,6 @@ def main():
                 non_expert_agg=non_expert_agg,
             )
 
-            if meta_info is not None:
-                print_meta_alpha(meta_info.get("alpha", None))
-
         else:
             new_global_state_dict = aggregate_state_dicts(
                 client_state_dicts=client_state_dicts,
@@ -1102,7 +1102,7 @@ def main():
 
 
 # ------------------------------------------------------------
-# 20. 程序入口
+# 19. 程序入口
 # ------------------------------------------------------------
 if __name__ == "__main__":
     main()

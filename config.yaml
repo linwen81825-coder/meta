@@ -41,6 +41,10 @@ meta:
     - expert_freq
     - delta_norm_z
     - expert_loss_z
+  active_mask: true
+  active_threshold: 0.0
+  min_active_clients_per_expert: 2
+  
 aggregation:
   # non_expert_agg 支持：uniform / sample_weighted
   non_expert_agg: sample_weighted
