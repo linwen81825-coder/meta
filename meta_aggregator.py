@@ -21,8 +21,21 @@
 #   聚合得到最终 expert 参数
 #
 # 日志：
-#   元网络输入和最终聚合权重都会追加写入当前实验的 train.log。
+#   元网络输入、最终聚合权重、元网络诊断信息都会追加写入当前实验的 train.log。
 #   日志路径由 train.py 传进来，不能写死。
+#
+# 新增诊断：
+#   1. score_std:
+#       元网络 softmax 前 score 的标准差。
+#       如果很小，说明不同 client-expert 的 score 没拉开。
+#
+#   2. alpha_entropy:
+#       alpha 的归一化熵，范围大约 0~1。
+#       越接近 1，说明 alpha 越接近 uniform。
+#
+#   3. meta_grad_norm:
+#       元网络参数梯度范数。
+#       如果很小，说明 validation loss 几乎推不动元网络。
 #
 # 注意：
 #   这里不能用 model.load_state_dict() 做临时模型。
@@ -354,7 +367,104 @@ class MetaExpertAggregator:
         return features
 
     # --------------------------------------------------------
-    # 5.2 把元网络输入写入 train.log，不打印到控制台
+    # 5.2 计算 alpha 诊断信息
+    # --------------------------------------------------------
+    def compute_alpha_stats(self, scores, alpha):
+        """
+        根据 softmax 前 scores 和 softmax 后 alpha 计算诊断指标。
+
+        score_std:
+            softmax 前 score 的整体标准差。
+            如果很小，说明 score 没拉开，alpha 很容易接近 uniform。
+
+        alpha_entropy:
+            alpha 的归一化熵。
+            每个 expert 单独计算熵，再对 expert 求平均。
+            越接近 1，说明越接近 uniform。
+
+        alpha_std:
+            alpha 的整体标准差。
+            越小越接近 uniform。
+
+        alpha_max_mean:
+            每个 expert 最大客户端权重的平均值。
+            如果接近 1 / num_clients，说明没选出明显重要客户端。
+        """
+
+        with torch.no_grad():
+            scores_detached = scores.detach().float()
+            alpha_detached = alpha.detach().float()
+
+            num_clients = alpha_detached.size(1)
+
+            score_std = scores_detached.std(unbiased=False).item()
+            score_abs_mean = scores_detached.abs().mean().item()
+
+            eps = 1e-12
+            entropy = -torch.sum(
+                alpha_detached * torch.log(alpha_detached.clamp_min(eps)),
+                dim=1,
+            )
+
+            if num_clients > 1:
+                entropy = entropy / np.log(num_clients)
+
+            alpha_entropy = entropy.mean().item()
+
+            alpha_std = alpha_detached.std(unbiased=False).item()
+            alpha_max_mean = alpha_detached.max(dim=1).values.mean().item()
+            alpha_min_mean = alpha_detached.min(dim=1).values.mean().item()
+
+        stats = {
+            "score_std": score_std,
+            "score_abs_mean": score_abs_mean,
+            "alpha_entropy": alpha_entropy,
+            "alpha_std": alpha_std,
+            "alpha_max_mean": alpha_max_mean,
+            "alpha_min_mean": alpha_min_mean,
+        }
+
+        return stats
+
+    # --------------------------------------------------------
+    # 5.3 计算元网络梯度范数
+    # --------------------------------------------------------
+    def compute_meta_grad_norm(self):
+        """
+        计算元网络参数梯度范数。
+
+        返回：
+            grad_norm:
+                所有元网络参数梯度拼起来后的 L2 norm。
+
+            grad_max_abs:
+                梯度绝对值最大值。
+
+        用途：
+            判断 validation loss 是否真的在推动元网络。
+            如果 grad_norm 长期接近 0，说明 meta loss 对元网络几乎没有有效梯度。
+        """
+
+        total_sq = 0.0
+        grad_max_abs = 0.0
+
+        for param in self.meta_net.parameters():
+            if param.grad is None:
+                continue
+
+            grad = param.grad.detach().float()
+
+            total_sq += torch.sum(grad * grad).item()
+
+            current_max = grad.abs().max().item()
+            grad_max_abs = max(grad_max_abs, current_max)
+
+        grad_norm = total_sq ** 0.5
+
+        return grad_norm, grad_max_abs
+
+    # --------------------------------------------------------
+    # 5.4 把元网络输入写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_inputs(
         self,
@@ -417,7 +527,7 @@ class MetaExpertAggregator:
             f.write(f"[META_INPUT_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.3 把最终聚合权重 alpha 写入 train.log，不打印到控制台
+    # 5.5 把最终聚合权重 alpha 写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_alpha(
         self,
@@ -462,13 +572,91 @@ class MetaExpertAggregator:
             f.write(f"[META_ALPHA_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.4 元网络输出 alpha
+    # 5.6 记录 meta 训练诊断信息
+    # --------------------------------------------------------
+    def log_meta_diagnostics(
+        self,
+        step_id,
+        meta_loss_value,
+        alpha_stats,
+        meta_grad_norm,
+        meta_grad_max_abs,
+    ):
+        """
+        记录每个 meta step 的诊断信息。
+
+        日志字段：
+            score_std:
+                softmax 前 score 标准差。
+
+            alpha_entropy:
+                alpha 归一化熵，越接近 1 越 uniform。
+
+            meta_grad_norm:
+                元网络梯度 L2 norm。
+
+            meta_grad_max_abs:
+                元网络最大梯度绝对值。
+        """
+
+        os.makedirs(
+            os.path.dirname(self.train_log_path),
+            exist_ok=True,
+        )
+
+        with open(self.train_log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"[META_DIAG] "
+                f"round={self.round_id} "
+                f"step={step_id} "
+                f"meta_loss={meta_loss_value:.8f} "
+                f"score_std={alpha_stats['score_std']:.8f} "
+                f"score_abs_mean={alpha_stats['score_abs_mean']:.8f} "
+                f"alpha_entropy={alpha_stats['alpha_entropy']:.8f} "
+                f"alpha_std={alpha_stats['alpha_std']:.8f} "
+                f"alpha_max_mean={alpha_stats['alpha_max_mean']:.8f} "
+                f"alpha_min_mean={alpha_stats['alpha_min_mean']:.8f} "
+                f"meta_grad_norm={meta_grad_norm:.8f} "
+                f"meta_grad_max_abs={meta_grad_max_abs:.8f}\n"
+            )
+
+    # --------------------------------------------------------
+    # 5.7 记录最终 alpha 的诊断信息
+    # --------------------------------------------------------
+    def log_meta_final_diagnostics(self, alpha_stats):
+        """
+        记录元网络更新完成后，最终 alpha 的诊断信息。
+
+        注意：
+            这里没有 grad_norm，因为最终 alpha 是 no_grad 下重新计算的。
+        """
+
+        os.makedirs(
+            os.path.dirname(self.train_log_path),
+            exist_ok=True,
+        )
+
+        with open(self.train_log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"[META_DIAG_FINAL] "
+                f"round={self.round_id} "
+                f"score_std={alpha_stats['score_std']:.8f} "
+                f"score_abs_mean={alpha_stats['score_abs_mean']:.8f} "
+                f"alpha_entropy={alpha_stats['alpha_entropy']:.8f} "
+                f"alpha_std={alpha_stats['alpha_std']:.8f} "
+                f"alpha_max_mean={alpha_stats['alpha_max_mean']:.8f} "
+                f"alpha_min_mean={alpha_stats['alpha_min_mean']:.8f}\n"
+            )
+
+    # --------------------------------------------------------
+    # 5.8 元网络输出 alpha
     # --------------------------------------------------------
     def compute_alpha(
         self,
         client_losses,
         client_expert_freqs,
         client_num_samples,
+        return_stats=False,
     ):
         """
         用元网络计算 expert 聚合权重 alpha。
@@ -476,6 +664,17 @@ class MetaExpertAggregator:
         输出：
             alpha:
                 shape: [num_experts, num_clients]
+
+        如果 return_stats=True：
+            返回：
+                alpha, stats
+
+            其中 stats 包含：
+                score_std
+                alpha_entropy
+                alpha_std
+                alpha_max_mean
+                alpha_min_mean
         """
 
         features = self.build_meta_features(
@@ -487,15 +686,28 @@ class MetaExpertAggregator:
         num_experts, num_clients, input_dim = features.shape
 
         flat_features = features.reshape(num_experts * num_clients, input_dim)
+
+        # [E*C]
         flat_scores = self.meta_net(flat_features)
+
+        # [E, C]
         scores = flat_scores.reshape(num_experts, num_clients)
 
+        # 对每个 expert，在 client 维度做 softmax
         alpha = F.softmax(scores, dim=1)
+
+        if return_stats:
+            stats = self.compute_alpha_stats(
+                scores=scores,
+                alpha=alpha,
+            )
+
+            return alpha, stats
 
         return alpha
 
     # --------------------------------------------------------
-    # 5.5 根据 alpha 构造聚合后的 state_dict
+    # 5.9 根据 alpha 构造聚合后的 state_dict
     # --------------------------------------------------------
     def build_aggregated_state_dict(
         self,
@@ -579,7 +791,7 @@ class MetaExpertAggregator:
         return new_state_dict
 
     # --------------------------------------------------------
-    # 5.6 在 server validation set 上计算 CE loss
+    # 5.10 在 server validation set 上计算 CE loss
     # --------------------------------------------------------
     def compute_validation_loss(self, model, temp_state_dict, val_loader):
         """
@@ -623,7 +835,7 @@ class MetaExpertAggregator:
         return avg_loss
 
     # --------------------------------------------------------
-    # 5.7 主函数：更新元网络并返回最终聚合模型
+    # 5.11 主函数：更新元网络并返回最终聚合模型
     # --------------------------------------------------------
     def aggregate(
         self,
@@ -654,15 +866,18 @@ class MetaExpertAggregator:
         # ----------------------------------------------------
         # 第一步：用验证集 CE loss 更新元网络
         # ----------------------------------------------------
-        for _ in range(self.meta_steps):
+        for step_id in range(1, self.meta_steps + 1):
             self.optimizer.zero_grad()
 
-            alpha = self.compute_alpha(
+            # 1. 元网络输出 alpha，alpha 带计算图
+            alpha, alpha_stats = self.compute_alpha(
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
                 client_num_samples=client_num_samples,
+                return_stats=True,
             )
 
+            # 2. 用 alpha 构造临时聚合模型参数
             temp_state_dict = self.build_aggregated_state_dict(
                 client_state_dicts=client_state_dicts,
                 client_num_samples=client_num_samples,
@@ -671,25 +886,45 @@ class MetaExpertAggregator:
                 device=self.device,
             )
 
+            # 3. 用临时模型在 server validation set 上算 CE loss
             meta_loss = self.compute_validation_loss(
                 model=model,
                 temp_state_dict=temp_state_dict,
                 val_loader=val_loader,
             )
 
+            # 4. 反向传播
             meta_loss.backward()
-            self.optimizer.step()
+
+            # 5. 记录元网络梯度范数
+            meta_grad_norm, meta_grad_max_abs = self.compute_meta_grad_norm()
 
             meta_loss_value = meta_loss.item()
+
+            self.log_meta_diagnostics(
+                step_id=step_id,
+                meta_loss_value=meta_loss_value,
+                alpha_stats=alpha_stats,
+                meta_grad_norm=meta_grad_norm,
+                meta_grad_max_abs=meta_grad_max_abs,
+            )
+
+            # 6. 更新元网络
+            self.optimizer.step()
 
         # ----------------------------------------------------
         # 第二步：用更新后的元网络输出最终 alpha
         # ----------------------------------------------------
         with torch.no_grad():
-            final_alpha = self.compute_alpha(
+            final_alpha, final_alpha_stats = self.compute_alpha(
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
                 client_num_samples=client_num_samples,
+                return_stats=True,
+            )
+
+            self.log_meta_final_diagnostics(
+                alpha_stats=final_alpha_stats,
             )
 
             self.log_meta_alpha(
@@ -708,6 +943,8 @@ class MetaExpertAggregator:
         info = {
             "meta_loss": meta_loss_value,
             "alpha": final_alpha.detach().cpu(),
+            "score_std": final_alpha_stats["score_std"],
+            "alpha_entropy": final_alpha_stats["alpha_entropy"],
         }
 
         return final_state_dict, info
