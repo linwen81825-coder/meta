@@ -34,6 +34,7 @@ meta:
   lr: 0.001
   steps: 1
   max_val_batches: 4
+  tau: 0.5
   input_features:
     - loss_z
     - sample_ratio

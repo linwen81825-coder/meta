@@ -2,17 +2,6 @@
 # ------------------------------------------------------------
 # 最小版 FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
 #
-# 功能：
-# 1. 读取 config.yaml
-# 2. 加载 CIFAR10
-# 3. 用 Dirichlet 把训练集划分给多个客户端
-# 4. 每个客户端本地训练
-# 5. 服务端聚合参数
-#    - expert 参数使用 expert_agg
-#    - non-expert 参数使用 non_expert_agg
-# 6. 每轮测试全局模型准确率
-# 7. 自动保存训练日志到 dataset.data_root/logs/train.log
-#
 # 当前支持：
 # 1. 从测试集划分 server validation set
 # 2. 客户端本地训练时统计：
@@ -26,6 +15,8 @@
 # 4. 支持 router balance loss
 # 5. 支持 top-k routing，其中 top_k 从 config.yaml 的 model.top_k 读取
 # 6. 元网络输入特征由 meta.input_features 控制
+# 7. 支持 meta.tau，控制 softmax 输出 alpha 的尖锐程度
+# 8. 每轮打印元网络输出的 expert 聚合权重
 # ------------------------------------------------------------
 
 import argparse
@@ -495,48 +486,20 @@ def update_expert_loss_stats(
     """
     统计每个 expert 对应样本上的平均 CE loss。
 
-    输入：
-        expert_loss_sums:
-            shape: [num_experts]
-            每个 expert 累积的 loss 加权和。
+    top1:
+        一个样本只贡献给被选中的 expert。
 
-        expert_loss_weights:
-            shape: [num_experts]
-            每个 expert 累积的权重和。
-
-        per_sample_loss:
-            shape: [B]
-            每个样本的 CE loss。
-
-        info:
-            model(images, return_info=True) 返回的信息。
-
-    统计方式：
-        top1:
-            一个样本只贡献给被选中的 expert。
-
-        top2/topk:
-            一个样本会贡献给 top-k expert。
-            这里用 topk_gates 作为权重。
-            例如 top2 gates=[0.7, 0.3]，
-            那这个样本的 loss 会按 0.7 / 0.3 分给两个 expert。
-
-    注意：
-        这里统计的是最终 logits 的 CE loss。
-        因为当前 model.py 没有单独返回每个 expert 自己的 logits，
-        所以这是最小改法。
+    top2/topk:
+        一个样本会贡献给 top-k expert。
+        这里用 topk_gates 作为权重。
     """
 
     num_experts = expert_loss_sums.numel()
 
     loss_cpu = per_sample_loss.detach().cpu().float()
 
-    # --------------------------------------------------------
-    # top-k 情况：优先使用 topk_indices / topk_gates
-    # --------------------------------------------------------
     if "topk_indices" in info:
         expert_indices = info["topk_indices"].detach().cpu()
-        # expert_indices: [B, K]
 
         if "topk_gates" in info:
             expert_gates = info["topk_gates"].detach().cpu().float()
@@ -565,9 +528,6 @@ def update_expert_loss_stats(
             minlength=num_experts,
         )
 
-    # --------------------------------------------------------
-    # top1 情况：只使用 top1_indices
-    # --------------------------------------------------------
     else:
         expert_indices = info["top1_indices"].detach().cpu().reshape(-1)
 
@@ -599,15 +559,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
         avg_loss
         expert_freq
         expert_loss
-
-    其中：
-        expert_freq:
-            当前客户端每个 expert 的激活频率。
-            shape: [num_experts]
-
-        expert_loss:
-            当前客户端每个 expert 对应样本上的平均 CE loss。
-            shape: [num_experts]
     """
 
     train_cfg = cfg["train"]
@@ -622,7 +573,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
     model.to(device)
     model.train()
 
-    # reduction="none" 用于得到每个样本自己的 loss，方便统计 expert_loss。
     criterion = nn.CrossEntropyLoss(reduction="none")
 
     optimizer = torch.optim.SGD(
@@ -661,28 +611,19 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
             logits, info = model(images, return_info=True)
 
-            # ------------------------------------------------
-            # 1. 统计 expert 激活频率
-            # ------------------------------------------------
-            expert_indices = info.get(
-                "topk_indices",
-                info["top1_indices"],
-            )
+            if "topk_indices" in info:
+                expert_indices = info["topk_indices"]
+            else:
+                expert_indices = info["top1_indices"]
 
             update_expert_counts(
                 expert_counts=expert_counts,
                 expert_indices=expert_indices,
             )
 
-            # ------------------------------------------------
-            # 2. 计算每个样本的 CE loss
-            # ------------------------------------------------
             per_sample_ce_loss = criterion(logits, labels)
             ce_loss = per_sample_ce_loss.mean()
 
-            # ------------------------------------------------
-            # 3. 统计每个 expert 的平均 loss
-            # ------------------------------------------------
             update_expert_loss_stats(
                 expert_loss_sums=expert_loss_sums,
                 expert_loss_weights=expert_loss_weights,
@@ -690,9 +631,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
                 info=info,
             )
 
-            # ------------------------------------------------
-            # 4. router balance loss
-            # ------------------------------------------------
             balance_loss = torch.tensor(
                 0.0,
                 device=device,
@@ -709,7 +647,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
                     info["router_probs"]
                 )
 
-            # 反向传播使用总 loss
             loss = ce_loss + router_balance_weight * balance_loss
 
             loss.backward()
@@ -717,7 +654,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
             batch_size = images.size(0)
 
-            # client_loss 仍然记录纯 CE loss，不记录加了 balance_loss 的总 loss。
             total_loss += per_sample_ce_loss.detach().sum().item()
             total_samples += batch_size
 
@@ -726,11 +662,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
     expert_freq = counts_to_frequency(expert_counts)
     expert_freq = expert_freq.numpy().tolist()
 
-    # --------------------------------------------------------
-    # expert_loss:
-    #   如果某个 expert 完全没有被选中，weight=0。
-    #   这种情况下用当前客户端 avg_loss 兜底，避免 nan。
-    # --------------------------------------------------------
     expert_loss_values = []
 
     for expert_id in range(num_experts):
@@ -837,9 +768,7 @@ def aggregate_state_dicts(
     普通聚合函数。
 
     当 expert_agg 是 uniform 或 sample_weighted 时使用这个函数。
-
-    如果 expert_agg = meta_network，
-    不走这里，而是调用 MetaExpertAggregator。
+    如果 expert_agg = meta_network，不走这里，而是调用 MetaExpertAggregator。
     """
 
     agg_cfg = cfg["aggregation"]
@@ -910,6 +839,9 @@ def print_meta_alpha(alpha):
     if alpha is None:
         return
 
+    if isinstance(alpha, torch.Tensor):
+        alpha = alpha.detach().cpu()
+
     print("========== Meta expert alpha ==========")
 
     num_experts = alpha.shape[0]
@@ -950,26 +882,17 @@ def main():
     device = get_device(cfg)
     print(f"使用设备: {device}")
 
-    # --------------------------------------------------------
-    # 加载数据
-    # --------------------------------------------------------
     train_set, test_set = run_without_file_logging(
         build_datasets,
         cfg,
     )
 
-    # --------------------------------------------------------
-    # 从测试集划分 server validation set
-    # --------------------------------------------------------
     server_val_set, final_test_set = split_server_validation_from_test_set(
         test_set=test_set,
         cfg=cfg,
         seed=seed,
     )
 
-    # --------------------------------------------------------
-    # 客户端训练数据使用完整 train_set
-    # --------------------------------------------------------
     dataset_cfg = cfg["dataset"]
 
     client_indices = dirichlet_partition(
@@ -1000,9 +923,6 @@ def main():
         device=device,
     )
 
-    # --------------------------------------------------------
-    # 初始化全局模型
-    # --------------------------------------------------------
     global_model = build_model(cfg)
     global_model.to(device)
 
@@ -1021,9 +941,6 @@ def main():
 
     best_acc = 0.0
 
-    # --------------------------------------------------------
-    # 如果 expert_agg=meta_network，就初始化元聚合器
-    # --------------------------------------------------------
     expert_agg = agg_cfg["expert_agg"]
     non_expert_agg = agg_cfg["non_expert_agg"]
 
@@ -1043,6 +960,7 @@ def main():
             meta_steps=meta_cfg.get("steps", 1),
             max_val_batches=meta_cfg.get("max_val_batches", 4),
             train_log_path=log_path,
+            tau=meta_cfg.get("tau", 1.0),
             input_features=meta_cfg.get(
                 "input_features",
                 [
@@ -1057,9 +975,6 @@ def main():
     else:
         print(f"使用普通 expert_agg = {expert_agg}")
 
-    # --------------------------------------------------------
-    # 打印训练配置
-    # --------------------------------------------------------
     print("========== 训练配置 ==========")
     print(f"rounds            : {rounds}")
     print(f"num_clients       : {num_clients}")
@@ -1080,6 +995,7 @@ def main():
         print(f"meta.hidden_dim     : {meta_cfg.get('hidden_dim', 32)}")
         print(f"meta.lr             : {meta_cfg.get('lr', 1e-3)}")
         print(f"meta.steps          : {meta_cfg.get('steps', 1)}")
+        print(f"meta.tau            : {meta_cfg.get('tau', 1.0)}")
         print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
 
         if meta_aggregator is not None:
@@ -1088,9 +1004,6 @@ def main():
 
     print("==============================")
 
-    # --------------------------------------------------------
-    # FL 主循环
-    # --------------------------------------------------------
     for round_id in range(1, rounds + 1):
         global_state_dict = {
             name: tensor.detach().cpu().clone()
@@ -1105,9 +1018,6 @@ def main():
         client_expert_freqs = []
         client_expert_losses = []
 
-        # ----------------------------------------------------
-        # 客户端本地训练
-        # ----------------------------------------------------
         for client_id in selected_clients:
             (
                 local_state_dict,
@@ -1128,9 +1038,6 @@ def main():
             client_expert_freqs.append(expert_freq)
             client_expert_losses.append(expert_loss)
 
-        # ----------------------------------------------------
-        # 服务端聚合
-        # ----------------------------------------------------
         meta_info = None
 
         if expert_agg == "meta_network":
@@ -1145,6 +1052,9 @@ def main():
                 non_expert_agg=non_expert_agg,
             )
 
+            if meta_info is not None:
+                print_meta_alpha(meta_info.get("alpha", None))
+
         else:
             new_global_state_dict = aggregate_state_dicts(
                 client_state_dicts=client_state_dicts,
@@ -1154,9 +1064,6 @@ def main():
 
         global_model.load_state_dict(new_global_state_dict)
 
-        # ----------------------------------------------------
-        # 测试全局模型
-        # ----------------------------------------------------
         test_acc, test_loss = evaluate(
             model=global_model,
             test_loader=test_loader,
@@ -1167,9 +1074,6 @@ def main():
 
         avg_client_loss = float(np.mean(client_losses))
 
-        # ----------------------------------------------------
-        # 打印日志
-        # ----------------------------------------------------
         if meta_info is not None:
             meta_loss = meta_info.get("meta_loss", None)
 

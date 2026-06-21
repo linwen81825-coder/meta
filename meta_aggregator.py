@@ -5,6 +5,7 @@
 # 当前支持通过 config.yaml 控制元网络输入特征：
 #
 # meta:
+#   tau: 0.5
 #   input_features:
 #     - loss_z
 #     - sample_ratio
@@ -24,34 +25,23 @@
 #
 #   expert_loss_z:
 #       当前客户端当前 expert 对应样本平均 CE loss 的标准化值。
-#       计算方式：
-#           expert_loss_z[e, i]
-#           =
-#           (expert_loss[e, i] - mean_i(expert_loss[e, i]))
-#           /
-#           std_i(expert_loss[e, i])
 #
 #   delta_norm_z:
 #       当前客户端当前 expert 参数更新幅度的标准化值。
-#       计算方式：
-#           delta_norm[e, i] = || theta_i,e - theta_global,e ||
-#       然后对每个 expert，在 client 维度做 z-score。
 #
-# 注意：
-#   所有特征全部按配置判断。
-#   配置里有哪个，就计算哪个；
-#   配置里没有，就不计算。
+# 新增：
+#   tau:
+#       softmax 温度系数。
+#       alpha = softmax(scores / tau)
 #
-# 日志：
-#   元网络输入、最终聚合权重、元网络诊断信息都会追加写入当前实验的 train.log。
-#   日志路径由 train.py 传进来，不能写死。
+#       tau < 1:
+#           alpha 更尖锐，客户端权重区分度更大。
 #
-# 重要：
-#   这里不能用 model.load_state_dict() 做临时模型。
-#   因为 load_state_dict() 不可微，验证集 loss 不能反传到元网络。
+#       tau = 1:
+#           普通 softmax。
 #
-#   所以这里用 torch.func.functional_call()。
-#   这样临时聚合出来的 expert 参数仍然和元网络 alpha 有计算图关系。
+#       tau > 1:
+#           alpha 更平滑，更接近 uniform。
 # ------------------------------------------------------------
 
 import os
@@ -152,12 +142,6 @@ def update_expert_counts(expert_counts, expert_indices):
 def counts_to_frequency(expert_counts):
     """
     把 expert 激活次数转换成 expert 激活频率。
-
-    例如：
-        counts = [10, 20, 0, 70]
-
-    转成：
-        freq = [0.1, 0.2, 0.0, 0.7]
     """
 
     total = expert_counts.sum().item()
@@ -176,13 +160,6 @@ class MetaWeightNet(nn.Module):
     元网络。
 
     输入维度由 config.yaml 里的 meta.input_features 决定。
-
-    例如：
-        input_features = [loss_z, sample_ratio, expert_freq]
-        input_dim = 3
-
-        input_features = [loss_z, sample_ratio, expert_freq, expert_loss_z, delta_norm_z]
-        input_dim = 5
     """
 
     def __init__(self, input_dim, hidden_dim=32):
@@ -239,15 +216,18 @@ class MetaExpertAggregator:
         max_val_batches=4,
         train_log_path=None,
         input_features=None,
+        tau=1.0,
     ):
         self.num_experts = num_experts
         self.device = device
         self.meta_steps = meta_steps
         self.max_val_batches = max_val_batches
 
-        # ----------------------------------------------------
-        # 元网络输入特征配置
-        # ----------------------------------------------------
+        if tau <= 0:
+            raise ValueError(f"meta.tau 必须大于 0，当前 tau={tau}")
+
+        self.tau = float(tau)
+
         if input_features is None:
             input_features = [
                 "loss_z",
@@ -463,26 +443,9 @@ class MetaExpertAggregator:
             client_expert_losses:
                 shape: [num_clients, num_experts]
 
-        中间量：
-            expert_loss[e, i] 表示：
-                client i 上 expert e 对应样本的平均 CE loss。
-
         输出：
             expert_loss_z:
                 shape: [num_experts, num_clients]
-
-        标准化方式：
-            对每个 expert，在 client 维度做 z-score：
-
-            expert_loss_z[e, i]
-            =
-            (expert_loss[e, i] - mean_i(expert_loss[e, i]))
-            /
-            std_i(expert_loss[e, i])
-
-        注意：
-            train.py 传进来的仍然是原始 expert_loss。
-            这里只负责把它变成 expert_loss_z。
         """
 
         if client_expert_losses is None:
@@ -515,7 +478,6 @@ class MetaExpertAggregator:
                 f"但是输入 expert_losses.shape={expert_losses.shape}"
             )
 
-        # [C, E] -> [E, C]
         expert_loss = expert_losses.transpose(0, 1)
 
         loss_mean = expert_loss.mean(
@@ -662,11 +624,6 @@ class MetaExpertAggregator:
             expert_loss_z
             delta_norm_z
 
-        重点：
-            所有特征全部按 self.input_feature_names 判断。
-            配置里写了哪个，就计算哪个；
-            配置里没写，就不计算。
-
         输出：
             features:
                 shape: [num_experts, num_clients, input_dim]
@@ -805,8 +762,6 @@ class MetaExpertAggregator:
     ):
         """
         记录元网络输入特征到当前实验 train.log。
-
-        会按照 self.input_feature_names 自动记录当前元网络实际输入。
         """
 
         os.makedirs(
@@ -860,10 +815,6 @@ class MetaExpertAggregator:
     ):
         """
         记录元网络最终输出的 expert 聚合权重到当前实验 train.log。
-
-        这里仍然记录 sample_weighted_weight，
-        只是为了方便你对比 meta alpha 和普通样本加权的差异。
-        它不代表 sample_ratio 一定作为元网络输入。
         """
 
         os.makedirs(
@@ -994,7 +945,7 @@ class MetaExpertAggregator:
 
         scores = flat_scores.reshape(num_experts, num_clients)
 
-        alpha = F.softmax(scores, dim=1)
+        alpha = F.softmax(scores / self.tau, dim=1)
 
         if return_stats:
             stats = self.compute_alpha_stats(
@@ -1047,9 +998,6 @@ class MetaExpertAggregator:
                 new_state_dict[name] = first_tensor.to(device).clone()
                 continue
 
-            # ------------------------------------------------
-            # expert 参数：使用元网络 alpha 聚合
-            # ------------------------------------------------
             if is_expert_param(name):
                 expert_id = get_expert_id_from_name(name)
 
@@ -1070,9 +1018,6 @@ class MetaExpertAggregator:
 
                 new_state_dict[name] = aggregated_tensor
 
-            # ------------------------------------------------
-            # non-expert 参数：使用普通聚合
-            # ------------------------------------------------
             else:
                 aggregated_tensor = torch.zeros_like(
                     first_tensor,
@@ -1096,9 +1041,6 @@ class MetaExpertAggregator:
     def compute_validation_loss(self, model, temp_state_dict, val_loader):
         """
         用临时聚合参数在 server validation set 上计算 CE loss。
-
-        关键点：
-            这里用 functional_call，不用 load_state_dict。
         """
 
         model.eval()
@@ -1154,8 +1096,6 @@ class MetaExpertAggregator:
 
         model.to(self.device)
 
-        # 当前轮客户端训练前的全局模型参数。
-        # delta_norm_z 需要用它和 client_state_dicts 做差。
         global_state_dict = {
             name: tensor.detach().cpu().clone()
             for name, tensor in model.state_dict().items()
@@ -1174,9 +1114,6 @@ class MetaExpertAggregator:
 
         meta_loss_value = None
 
-        # ----------------------------------------------------
-        # 第一步：用验证集 CE loss 更新元网络
-        # ----------------------------------------------------
         for step_id in range(1, self.meta_steps + 1):
             self.optimizer.zero_grad()
 
@@ -1220,9 +1157,6 @@ class MetaExpertAggregator:
 
             self.optimizer.step()
 
-        # ----------------------------------------------------
-        # 第二步：用更新后的元网络输出最终 alpha
-        # ----------------------------------------------------
         with torch.no_grad():
             final_alpha, final_alpha_stats = self.compute_alpha(
                 client_losses=client_losses,
