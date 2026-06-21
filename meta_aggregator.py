@@ -9,7 +9,7 @@
 #     - loss_z
 #     - sample_ratio
 #     - expert_freq
-#     - expert_loss
+#     - expert_loss_z
 #     - delta_norm_z
 #
 # 当前支持五个输入特征：
@@ -22,8 +22,14 @@
 #   expert_freq:
 #       当前客户端上当前 expert 的激活频率。
 #
-#   expert_loss:
-#       当前客户端当前 expert 对应样本上的平均 CE loss。
+#   expert_loss_z:
+#       当前客户端当前 expert 对应样本平均 CE loss 的标准化值。
+#       计算方式：
+#           expert_loss_z[e, i]
+#           =
+#           (expert_loss[e, i] - mean_i(expert_loss[e, i]))
+#           /
+#           std_i(expert_loss[e, i])
 #
 #   delta_norm_z:
 #       当前客户端当前 expert 参数更新幅度的标准化值。
@@ -175,7 +181,7 @@ class MetaWeightNet(nn.Module):
         input_features = [loss_z, sample_ratio, expert_freq]
         input_dim = 3
 
-        input_features = [loss_z, sample_ratio, expert_freq, expert_loss, delta_norm_z]
+        input_features = [loss_z, sample_ratio, expert_freq, expert_loss_z, delta_norm_z]
         input_dim = 5
     """
 
@@ -253,7 +259,7 @@ class MetaExpertAggregator:
             "loss_z",
             "sample_ratio",
             "expert_freq",
-            "expert_loss",
+            "expert_loss_z",
             "delta_norm_z",
         }
 
@@ -443,32 +449,45 @@ class MetaExpertAggregator:
         return expert_freq_feature
 
     # --------------------------------------------------------
-    # 5.5 特征：expert_loss
+    # 5.5 特征：expert_loss_z
     # --------------------------------------------------------
-    def build_expert_loss_feature(
+    def build_expert_loss_z_feature(
         self,
         client_expert_losses,
         num_clients,
     ):
         """
-        构造 expert_loss 特征。
+        构造 expert_loss_z 特征。
 
         输入：
             client_expert_losses:
                 shape: [num_clients, num_experts]
 
+        中间量：
+            expert_loss[e, i] 表示：
+                client i 上 expert e 对应样本的平均 CE loss。
+
         输出：
-            expert_loss_feature:
+            expert_loss_z:
                 shape: [num_experts, num_clients]
 
-        含义：
-            expert_loss_feature[e, i] 表示：
-                client i 上 expert e 对应样本的平均 CE loss。
+        标准化方式：
+            对每个 expert，在 client 维度做 z-score：
+
+            expert_loss_z[e, i]
+            =
+            (expert_loss[e, i] - mean_i(expert_loss[e, i]))
+            /
+            std_i(expert_loss[e, i])
+
+        注意：
+            train.py 传进来的仍然是原始 expert_loss。
+            这里只负责把它变成 expert_loss_z。
         """
 
         if client_expert_losses is None:
             raise ValueError(
-                "使用 expert_loss 时，必须从 train.py 传入 client_expert_losses。"
+                "使用 expert_loss_z 时，必须从 train.py 传入 client_expert_losses。"
             )
 
         expert_losses = torch.as_tensor(
@@ -496,9 +515,23 @@ class MetaExpertAggregator:
                 f"但是输入 expert_losses.shape={expert_losses.shape}"
             )
 
-        expert_loss_feature = expert_losses.transpose(0, 1)
+        # [C, E] -> [E, C]
+        expert_loss = expert_losses.transpose(0, 1)
 
-        return expert_loss_feature
+        loss_mean = expert_loss.mean(
+            dim=1,
+            keepdim=True,
+        )
+
+        loss_std = expert_loss.std(
+            dim=1,
+            unbiased=False,
+            keepdim=True,
+        ).clamp_min(1e-6)
+
+        expert_loss_z = (expert_loss - loss_mean) / loss_std
+
+        return expert_loss_z
 
     # --------------------------------------------------------
     # 5.6 计算 expert delta norm
@@ -626,7 +659,7 @@ class MetaExpertAggregator:
             loss_z
             sample_ratio
             expert_freq
-            expert_loss
+            expert_loss_z
             delta_norm_z
 
         重点：
@@ -664,8 +697,8 @@ class MetaExpertAggregator:
                     num_clients=num_clients,
                 )
 
-            elif feature_name == "expert_loss":
-                feature = self.build_expert_loss_feature(
+            elif feature_name == "expert_loss_z":
+                feature = self.build_expert_loss_z_feature(
                     client_expert_losses=client_expert_losses,
                     num_clients=num_clients,
                 )
