@@ -39,7 +39,7 @@ meta:
     - sample_ratio
     - expert_freq
     - delta_norm_z
-    
+    - expert_loss
 aggregation:
   # non_expert_agg 支持：uniform / sample_weighted
   non_expert_agg: sample_weighted

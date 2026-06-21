@@ -13,19 +13,19 @@
 # 6. 每轮测试全局模型准确率
 # 7. 自动保存训练日志到 dataset.data_root/logs/train.log
 #
-# 新增功能：
+# 当前支持：
 # 1. 从测试集划分 server validation set
 # 2. 客户端本地训练时统计：
 #    - client_loss
 #    - expert_activation_frequency
+#    - expert_loss
 # 3. 当 expert_agg = meta_network 时：
 #    - 调用 meta_aggregator.py 里的 MetaExpertAggregator
 #    - 用服务器验证集 loss 更新元网络
 #    - 再用元网络输出最终 expert 聚合权重
-# 4. 加入 router balance loss，缓解 expert 激活塌缩
+# 4. 支持 router balance loss
 # 5. 支持 top-k routing，其中 top_k 从 config.yaml 的 model.top_k 读取
-# 6. 保留自动日志保存
-# 7. 保留固定顺序客户端，不随机选择
+# 6. 元网络输入特征由 meta.input_features 控制
 # ------------------------------------------------------------
 
 import argparse
@@ -44,7 +44,6 @@ from torchvision import datasets, transforms
 
 from model import ResNet18SwitchMoE, is_expert_param, print_trainable_param_stats
 
-# 你的元网络专家聚合算法
 from meta_aggregator import (
     MetaExpertAggregator,
     update_expert_counts,
@@ -485,7 +484,110 @@ def compute_router_balance_loss(router_probs):
 
 
 # ------------------------------------------------------------
-# 12. 本地训练
+# 12. 统计 expert_loss
+# ------------------------------------------------------------
+def update_expert_loss_stats(
+    expert_loss_sums,
+    expert_loss_weights,
+    per_sample_loss,
+    info,
+):
+    """
+    统计每个 expert 对应样本上的平均 CE loss。
+
+    输入：
+        expert_loss_sums:
+            shape: [num_experts]
+            每个 expert 累积的 loss 加权和。
+
+        expert_loss_weights:
+            shape: [num_experts]
+            每个 expert 累积的权重和。
+
+        per_sample_loss:
+            shape: [B]
+            每个样本的 CE loss。
+
+        info:
+            model(images, return_info=True) 返回的信息。
+
+    统计方式：
+        top1:
+            一个样本只贡献给被选中的 expert。
+
+        top2/topk:
+            一个样本会贡献给 top-k expert。
+            这里用 topk_gates 作为权重。
+            例如 top2 gates=[0.7, 0.3]，
+            那这个样本的 loss 会按 0.7 / 0.3 分给两个 expert。
+
+    注意：
+        这里统计的是最终 logits 的 CE loss。
+        因为当前 model.py 没有单独返回每个 expert 自己的 logits，
+        所以这是最小改法。
+    """
+
+    num_experts = expert_loss_sums.numel()
+
+    loss_cpu = per_sample_loss.detach().cpu().float()
+
+    # --------------------------------------------------------
+    # top-k 情况：优先使用 topk_indices / topk_gates
+    # --------------------------------------------------------
+    if "topk_indices" in info:
+        expert_indices = info["topk_indices"].detach().cpu()
+        # expert_indices: [B, K]
+
+        if "topk_gates" in info:
+            expert_gates = info["topk_gates"].detach().cpu().float()
+        else:
+            expert_gates = torch.ones_like(
+                expert_indices,
+                dtype=torch.float32,
+            )
+            expert_gates = expert_gates / expert_gates.size(1)
+
+        loss_expand = loss_cpu.unsqueeze(1).expand_as(expert_gates)
+
+        flat_indices = expert_indices.reshape(-1)
+        flat_gates = expert_gates.reshape(-1)
+        flat_losses = loss_expand.reshape(-1)
+
+        loss_sum = torch.bincount(
+            flat_indices,
+            weights=flat_losses * flat_gates,
+            minlength=num_experts,
+        )
+
+        weight_sum = torch.bincount(
+            flat_indices,
+            weights=flat_gates,
+            minlength=num_experts,
+        )
+
+    # --------------------------------------------------------
+    # top1 情况：只使用 top1_indices
+    # --------------------------------------------------------
+    else:
+        expert_indices = info["top1_indices"].detach().cpu().reshape(-1)
+
+        loss_sum = torch.bincount(
+            expert_indices,
+            weights=loss_cpu,
+            minlength=num_experts,
+        )
+
+        weight_sum = torch.bincount(
+            expert_indices,
+            minlength=num_experts,
+        ).float()
+
+    expert_loss_sums += loss_sum
+    expert_loss_weights += weight_sum
+
+
+# ------------------------------------------------------------
+# 13. 本地训练
 # ------------------------------------------------------------
 def local_train(global_state_dict, train_loader, cfg, device):
     """
@@ -496,6 +598,16 @@ def local_train(global_state_dict, train_loader, cfg, device):
         num_samples
         avg_loss
         expert_freq
+        expert_loss
+
+    其中：
+        expert_freq:
+            当前客户端每个 expert 的激活频率。
+            shape: [num_experts]
+
+        expert_loss:
+            当前客户端每个 expert 对应样本上的平均 CE loss。
+            shape: [num_experts]
     """
 
     train_cfg = cfg["train"]
@@ -510,7 +622,8 @@ def local_train(global_state_dict, train_loader, cfg, device):
     model.to(device)
     model.train()
 
-    criterion = nn.CrossEntropyLoss()
+    # reduction="none" 用于得到每个样本自己的 loss，方便统计 expert_loss。
+    criterion = nn.CrossEntropyLoss(reduction="none")
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -527,6 +640,16 @@ def local_train(global_state_dict, train_loader, cfg, device):
         dtype=torch.long,
     )
 
+    expert_loss_sums = torch.zeros(
+        num_experts,
+        dtype=torch.float32,
+    )
+
+    expert_loss_weights = torch.zeros(
+        num_experts,
+        dtype=torch.float32,
+    )
+
     local_epochs = train_cfg["local_epochs"]
 
     for _ in range(local_epochs):
@@ -538,8 +661,9 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
             logits, info = model(images, return_info=True)
 
-            # top2 时优先统计 topk_indices；
-            # top1 时也兼容旧的 top1_indices。
+            # ------------------------------------------------
+            # 1. 统计 expert 激活频率
+            # ------------------------------------------------
             expert_indices = info.get(
                 "topk_indices",
                 info["top1_indices"],
@@ -550,8 +674,25 @@ def local_train(global_state_dict, train_loader, cfg, device):
                 expert_indices=expert_indices,
             )
 
-            ce_loss = criterion(logits, labels)
+            # ------------------------------------------------
+            # 2. 计算每个样本的 CE loss
+            # ------------------------------------------------
+            per_sample_ce_loss = criterion(logits, labels)
+            ce_loss = per_sample_ce_loss.mean()
 
+            # ------------------------------------------------
+            # 3. 统计每个 expert 的平均 loss
+            # ------------------------------------------------
+            update_expert_loss_stats(
+                expert_loss_sums=expert_loss_sums,
+                expert_loss_weights=expert_loss_weights,
+                per_sample_loss=per_sample_ce_loss,
+                info=info,
+            )
+
+            # ------------------------------------------------
+            # 4. router balance loss
+            # ------------------------------------------------
             balance_loss = torch.tensor(
                 0.0,
                 device=device,
@@ -568,6 +709,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
                     info["router_probs"]
                 )
 
+            # 反向传播使用总 loss
             loss = ce_loss + router_balance_weight * balance_loss
 
             loss.backward()
@@ -576,13 +718,30 @@ def local_train(global_state_dict, train_loader, cfg, device):
             batch_size = images.size(0)
 
             # client_loss 仍然记录纯 CE loss，不记录加了 balance_loss 的总 loss。
-            total_loss += ce_loss.item() * batch_size
+            total_loss += per_sample_ce_loss.detach().sum().item()
             total_samples += batch_size
 
     avg_loss = total_loss / max(total_samples, 1)
 
     expert_freq = counts_to_frequency(expert_counts)
     expert_freq = expert_freq.numpy().tolist()
+
+    # --------------------------------------------------------
+    # expert_loss:
+    #   如果某个 expert 完全没有被选中，weight=0。
+    #   这种情况下用当前客户端 avg_loss 兜底，避免 nan。
+    # --------------------------------------------------------
+    expert_loss_values = []
+
+    for expert_id in range(num_experts):
+        weight = expert_loss_weights[expert_id].item()
+
+        if weight > 0:
+            value = expert_loss_sums[expert_id].item() / weight
+        else:
+            value = avg_loss
+
+        expert_loss_values.append(float(value))
 
     local_state_dict = {
         name: tensor.detach().cpu().clone()
@@ -596,11 +755,17 @@ def local_train(global_state_dict, train_loader, cfg, device):
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return local_state_dict, num_samples, avg_loss, expert_freq
+    return (
+        local_state_dict,
+        num_samples,
+        avg_loss,
+        expert_freq,
+        expert_loss_values,
+    )
 
 
 # ------------------------------------------------------------
-# 13. 测试全局模型
+# 14. 测试全局模型
 # ------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, test_loader, device):
@@ -638,7 +803,7 @@ def evaluate(model, test_loader, device):
 
 
 # ------------------------------------------------------------
-# 14. 普通聚合权重
+# 15. 普通聚合权重
 # ------------------------------------------------------------
 def get_aggregation_weights(method, client_num_samples):
     """
@@ -661,7 +826,7 @@ def get_aggregation_weights(method, client_num_samples):
 
 
 # ------------------------------------------------------------
-# 15. 普通聚合客户端参数
+# 16. 普通聚合客户端参数
 # ------------------------------------------------------------
 def aggregate_state_dicts(
     client_state_dicts,
@@ -719,7 +884,7 @@ def aggregate_state_dicts(
 
 
 # ------------------------------------------------------------
-# 16. 打印客户端划分信息
+# 17. 打印客户端划分信息
 # ------------------------------------------------------------
 def print_partition_summary(client_indices):
     """
@@ -735,7 +900,7 @@ def print_partition_summary(client_indices):
 
 
 # ------------------------------------------------------------
-# 17. 打印 meta alpha
+# 18. 打印 meta alpha
 # ------------------------------------------------------------
 def print_meta_alpha(alpha):
     """
@@ -758,7 +923,7 @@ def print_meta_alpha(alpha):
 
 
 # ------------------------------------------------------------
-# 18. 主训练流程
+# 19. 主训练流程
 # ------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -878,13 +1043,6 @@ def main():
             meta_steps=meta_cfg.get("steps", 1),
             max_val_batches=meta_cfg.get("max_val_batches", 4),
             train_log_path=log_path,
-
-            # 元网络输入特征由 config.yaml 控制。
-            # 当前支持：
-            #   loss_z
-            #   sample_ratio
-            #   expert_freq
-            #   delta_norm_z
             input_features=meta_cfg.get(
                 "input_features",
                 [
@@ -924,17 +1082,9 @@ def main():
         print(f"meta.steps          : {meta_cfg.get('steps', 1)}")
         print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
 
-        # 打印元网络实际输入特征，方便做消融实验。
         if meta_aggregator is not None:
             input_features = ", ".join(meta_aggregator.input_feature_names)
             print(f"meta.input_features : [{input_features}]")
-
-    # 打印元网络实际输入特征，方便后续做 ablation 对比。
-    # 例如：
-    #   [loss_z, expert_freq]
-    if meta_aggregator is not None:
-        input_features = ", ".join(meta_aggregator.input_feature_names)
-        print(f"meta.input_features : [{input_features}]")
 
     print("==============================")
 
@@ -953,12 +1103,19 @@ def main():
         client_num_samples = []
         client_losses = []
         client_expert_freqs = []
+        client_expert_losses = []
 
         # ----------------------------------------------------
         # 客户端本地训练
         # ----------------------------------------------------
         for client_id in selected_clients:
-            local_state_dict, num_samples, avg_loss, expert_freq = local_train(
+            (
+                local_state_dict,
+                num_samples,
+                avg_loss,
+                expert_freq,
+                expert_loss,
+            ) = local_train(
                 global_state_dict=global_state_dict,
                 train_loader=client_loaders[client_id],
                 cfg=cfg,
@@ -969,6 +1126,7 @@ def main():
             client_num_samples.append(num_samples)
             client_losses.append(avg_loss)
             client_expert_freqs.append(expert_freq)
+            client_expert_losses.append(expert_loss)
 
         # ----------------------------------------------------
         # 服务端聚合
@@ -982,6 +1140,7 @@ def main():
                 client_num_samples=client_num_samples,
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
+                client_expert_losses=client_expert_losses,
                 val_loader=server_val_loader,
                 non_expert_agg=non_expert_agg,
             )
@@ -1039,7 +1198,7 @@ def main():
 
 
 # ------------------------------------------------------------
-# 19. 程序入口
+# 20. 程序入口
 # ------------------------------------------------------------
 if __name__ == "__main__":
     main()
