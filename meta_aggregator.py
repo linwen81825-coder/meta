@@ -6,12 +6,8 @@
 #
 # meta:
 #   input_features:
-#     - expert_freq
-#     - expert_count_log_z
 #     - expert_loss_z
 #     - delta_norm_z
-#     - grad_cos_z
-#     - val_delta_dot_z
 #
 # 当前支持八个输入特征：
 #   loss_z:
@@ -48,9 +44,26 @@
 #       ReLU
 #       Linear(hidden_dim, 1)
 #
-# 注意：
-#   本版不使用 Shared Encoder + Per-Expert Head。
-#   所有 expert 仍然共用同一个 MetaWeightNet。
+# 本版核心改动：
+#   原来 meta loss:
+#       用 alpha 聚合临时模型
+#       在 server validation set 上算 CE loss
+#       用 CE loss 更新 meta_net
+#
+#   现在 meta loss:
+#       先计算每个 client-expert 的质量目标：
+#           q_{e,i} = - val_delta_dot_z_{e,i}
+#
+#       然后直接用：
+#           L_meta = mean_e sum_i alpha_{e,i} * q_{e,i}
+#
+#   这样缩短了梯度链条：
+#       meta_net -> score -> alpha -> q loss
+#
+#   注意：
+#       本版不加 expert_count_prior。
+#       alpha 仍然是：
+#           alpha = softmax(score / tau)
 # ------------------------------------------------------------
 
 import os
@@ -234,9 +247,9 @@ class MetaExpertAggregator:
 
     它负责：
         1. 根据客户端统计特征生成 alpha
-        2. 用 alpha 临时聚合 expert 参数
-        3. 在 server validation set 上计算 CE loss
-        4. 用 CE loss 更新元网络
+        2. 计算 client-expert 质量目标 q
+        3. 用 alpha 和 q 直接计算 meta loss
+        4. 用 meta loss 更新元网络
         5. 用更新后的元网络输出最终 alpha
         6. 返回最终聚合后的完整 state_dict
     """
@@ -280,9 +293,8 @@ class MetaExpertAggregator:
 
         if input_features is None:
             input_features = [
-                "loss_z",
-                "sample_ratio",
-                "expert_freq",
+                "expert_loss_z",
+                "delta_norm_z",
             ]
 
         allowed_features = {
@@ -299,7 +311,7 @@ class MetaExpertAggregator:
         if not isinstance(input_features, (list, tuple)):
             raise TypeError(
                 "meta.input_features 必须是 list，例如："
-                "['expert_freq', 'expert_loss_z', 'delta_norm_z']"
+                "['expert_loss_z', 'delta_norm_z']"
             )
 
         input_features = list(input_features)
@@ -340,7 +352,23 @@ class MetaExpertAggregator:
         self.train_log_path = train_log_path
 
     # --------------------------------------------------------
-    # 5.1 基础检查：客户端数量
+    # 5.1 日志目录
+    # --------------------------------------------------------
+    def ensure_log_dir(self):
+        """
+        确保 train_log_path 所在目录存在。
+        """
+
+        log_dir = os.path.dirname(self.train_log_path)
+
+        if log_dir != "":
+            os.makedirs(
+                log_dir,
+                exist_ok=True,
+            )
+
+    # --------------------------------------------------------
+    # 5.2 基础检查：客户端数量
     # --------------------------------------------------------
     def get_num_clients(self, client_num_samples):
         """
@@ -355,7 +383,7 @@ class MetaExpertAggregator:
         return num_clients
 
     # --------------------------------------------------------
-    # 5.2 每个 expert 内按 client 维度做 z-score
+    # 5.3 每个 expert 内按 client 维度做 z-score
     # --------------------------------------------------------
     def zscore_by_expert(self, values):
         """
@@ -383,7 +411,7 @@ class MetaExpertAggregator:
         return (values - mean) / std
 
     # --------------------------------------------------------
-    # 5.3 特征：loss_z
+    # 5.4 特征：loss_z
     # --------------------------------------------------------
     def build_loss_z_feature(
         self,
@@ -424,7 +452,7 @@ class MetaExpertAggregator:
         return loss_z_feature
 
     # --------------------------------------------------------
-    # 5.4 特征：sample_ratio
+    # 5.5 特征：sample_ratio
     # --------------------------------------------------------
     def build_sample_ratio_feature(
         self,
@@ -463,7 +491,7 @@ class MetaExpertAggregator:
         return sample_ratio_feature
 
     # --------------------------------------------------------
-    # 5.5 特征：expert_freq
+    # 5.6 特征：expert_freq
     # --------------------------------------------------------
     def build_expert_freq_feature(
         self,
@@ -510,7 +538,7 @@ class MetaExpertAggregator:
         return expert_freq_feature
 
     # --------------------------------------------------------
-    # 5.6 特征：expert_count_log_z
+    # 5.7 特征：expert_count_log_z
     # --------------------------------------------------------
     def build_expert_count_log_z_feature(
         self,
@@ -578,7 +606,7 @@ class MetaExpertAggregator:
         return expert_count_log_z
 
     # --------------------------------------------------------
-    # 5.7 特征：expert_loss_z
+    # 5.8 特征：expert_loss_z
     # --------------------------------------------------------
     def build_expert_loss_z_feature(
         self,
@@ -634,7 +662,7 @@ class MetaExpertAggregator:
         return expert_loss_z
 
     # --------------------------------------------------------
-    # 5.8 计算 expert delta norm
+    # 5.9 计算 expert delta norm
     # --------------------------------------------------------
     def compute_expert_delta_norms(
         self,
@@ -704,7 +732,7 @@ class MetaExpertAggregator:
         return delta_norms
 
     # --------------------------------------------------------
-    # 5.9 特征：delta_norm_z
+    # 5.10 特征：delta_norm_z
     # --------------------------------------------------------
     def build_delta_norm_z_feature(
         self,
@@ -730,7 +758,7 @@ class MetaExpertAggregator:
         return delta_norm_z
 
     # --------------------------------------------------------
-    # 5.10 在 global model 上计算 server meta-val 的 expert 梯度
+    # 5.11 在 global model 上计算 server meta-val 的 expert 梯度
     # --------------------------------------------------------
     def compute_global_expert_val_gradients(self, model, val_loader):
         """
@@ -747,7 +775,7 @@ class MetaExpertAggregator:
 
         if val_loader is None:
             raise ValueError(
-                "使用 grad_cos_z / val_delta_dot_z 时，val_loader 不能为 None。"
+                "直接质量 meta loss 需要 val_loader，用来计算 val_delta_dot_z。"
             )
 
         model.to(self.device)
@@ -821,7 +849,7 @@ class MetaExpertAggregator:
         return expert_grads, expert_grad_sq
 
     # --------------------------------------------------------
-    # 5.11 特征：grad_cos_z 和 val_delta_dot_z
+    # 5.12 特征：grad_cos_z 和 val_delta_dot_z
     # --------------------------------------------------------
     def build_direction_quality_features(
         self,
@@ -847,12 +875,12 @@ class MetaExpertAggregator:
 
         if client_state_dicts is None:
             raise ValueError(
-                "使用 grad_cos_z / val_delta_dot_z 时，必须传入 client_state_dicts。"
+                "使用直接质量 meta loss 时，必须传入 client_state_dicts。"
             )
 
         if global_state_dict is None:
             raise ValueError(
-                "使用 grad_cos_z / val_delta_dot_z 时，必须传入 global_state_dict。"
+                "使用直接质量 meta loss 时，必须传入 global_state_dict。"
             )
 
         if len(client_state_dicts) != num_clients:
@@ -910,6 +938,9 @@ class MetaExpertAggregator:
                     diff_double * diff_double
                 ).item()
 
+                # 一阶近似：
+                # L(theta + delta) ≈ L(theta) + <g, delta>
+                # 所以 -<g, delta> 越大，越可能降低 val loss。
                 val_delta_dot[expert_id, client_id] += -torch.sum(
                     grad_double * diff_double
                 ).item()
@@ -936,7 +967,7 @@ class MetaExpertAggregator:
         return features
 
     # --------------------------------------------------------
-    # 5.12 构造本轮派生特征缓存，避免重复计算 val 梯度
+    # 5.13 构造本轮派生特征缓存
     # --------------------------------------------------------
     def build_derived_feature_cache(
         self,
@@ -951,8 +982,10 @@ class MetaExpertAggregator:
         """
         构造派生特征缓存。
 
-        这样做是为了避免：
-            compute_alpha 每个 meta step 都重复计算 server val 梯度。
+        注意：
+            本版直接质量 meta loss 必须使用 val_delta_dot_z 作为 q 目标。
+            因此无论 input_features 是否包含 val_delta_dot_z，
+            都会计算 direction_features。
         """
 
         cache = {}
@@ -964,26 +997,20 @@ class MetaExpertAggregator:
                 num_clients=num_clients,
             )
 
-        need_direction_features = (
-            "grad_cos_z" in self.input_feature_names
-            or "val_delta_dot_z" in self.input_feature_names
+        direction_features = self.build_direction_quality_features(
+            model=model,
+            val_loader=val_loader,
+            client_state_dicts=client_state_dicts,
+            global_state_dict=global_state_dict,
+            num_clients=num_clients,
         )
 
-        if need_direction_features:
-            direction_features = self.build_direction_quality_features(
-                model=model,
-                val_loader=val_loader,
-                client_state_dicts=client_state_dicts,
-                global_state_dict=global_state_dict,
-                num_clients=num_clients,
-            )
-
-            cache.update(direction_features)
+        cache.update(direction_features)
 
         return cache
 
     # --------------------------------------------------------
-    # 5.13 按配置构造元网络输入特征
+    # 5.14 按配置构造元网络输入特征
     # --------------------------------------------------------
     def build_meta_features(
         self,
@@ -1076,7 +1103,7 @@ class MetaExpertAggregator:
         return features
 
     # --------------------------------------------------------
-    # 5.14 根据 expert_freq 构造 active mask
+    # 5.15 根据 expert_freq 构造 active mask
     # --------------------------------------------------------
     def build_active_mask(
         self,
@@ -1130,7 +1157,7 @@ class MetaExpertAggregator:
         return active_mask
 
     # --------------------------------------------------------
-    # 5.15 计算 alpha 诊断信息
+    # 5.16 计算 alpha 诊断信息
     # --------------------------------------------------------
     def compute_alpha_stats(self, scores, alpha):
         """
@@ -1173,7 +1200,7 @@ class MetaExpertAggregator:
         return stats
 
     # --------------------------------------------------------
-    # 5.16 计算元网络梯度范数
+    # 5.17 计算元网络梯度范数
     # --------------------------------------------------------
     def compute_meta_grad_norm(self):
         """
@@ -1199,7 +1226,7 @@ class MetaExpertAggregator:
         return grad_norm, grad_max_abs
 
     # --------------------------------------------------------
-    # 5.17 把元网络输入写入 train.log，不打印到控制台
+    # 5.18 把元网络输入写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_inputs(
         self,
@@ -1215,10 +1242,7 @@ class MetaExpertAggregator:
         记录元网络输入特征到当前实验 train.log。
         """
 
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        self.ensure_log_dir()
 
         features = self.build_meta_features(
             client_losses=client_losses,
@@ -1258,7 +1282,49 @@ class MetaExpertAggregator:
             f.write(f"[META_INPUT_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.18 把最终聚合权重 alpha 写入 train.log，不打印到控制台
+    # 5.19 把 q 目标写入 train.log，不打印到控制台
+    # --------------------------------------------------------
+    def log_meta_quality_target(
+        self,
+        derived_feature_cache,
+    ):
+        """
+        记录 q 目标到 train.log。
+
+        q = - val_delta_dot_z
+
+        val_delta_dot_z 越大，说明越可能降低 validation loss；
+        因此 q 越小越好。
+        """
+
+        self.ensure_log_dir()
+
+        if "val_delta_dot_z" not in derived_feature_cache:
+            raise ValueError("derived_feature_cache 缺少 val_delta_dot_z")
+
+        val_delta_dot_z = derived_feature_cache["val_delta_dot_z"].detach().cpu()
+        q_target = -val_delta_dot_z
+
+        with open(self.train_log_path, "a", encoding="utf-8") as f:
+            f.write(f"[META_Q_BEGIN] round={self.round_id}\n")
+
+            num_experts, num_clients = q_target.shape
+
+            for expert_id in range(num_experts):
+                for client_id in range(num_clients):
+                    f.write(
+                        f"[META_Q] "
+                        f"round={self.round_id} "
+                        f"expert={expert_id} "
+                        f"client={client_id} "
+                        f"val_delta_dot_z={val_delta_dot_z[expert_id, client_id].item():.8f} "
+                        f"q={q_target[expert_id, client_id].item():.8f}\n"
+                    )
+
+            f.write(f"[META_Q_END] round={self.round_id}\n")
+
+    # --------------------------------------------------------
+    # 5.20 把最终聚合权重 alpha 写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_alpha(
         self,
@@ -1269,10 +1335,7 @@ class MetaExpertAggregator:
         记录元网络最终输出的 expert 聚合权重到当前实验 train.log。
         """
 
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        self.ensure_log_dir()
 
         alpha = alpha.detach().cpu()
 
@@ -1303,7 +1366,7 @@ class MetaExpertAggregator:
             f.write(f"[META_ALPHA_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.19 记录 meta 训练诊断信息
+    # 5.21 记录 meta 训练诊断信息
     # --------------------------------------------------------
     def log_meta_diagnostics(
         self,
@@ -1317,16 +1380,14 @@ class MetaExpertAggregator:
         记录每个 meta step 的诊断信息。
         """
 
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        self.ensure_log_dir()
 
         with open(self.train_log_path, "a", encoding="utf-8") as f:
             f.write(
                 f"[META_DIAG] "
                 f"round={self.round_id} "
                 f"step={step_id} "
+                f"meta_objective=alpha_quality "
                 f"meta_loss={meta_loss_value:.8f} "
                 f"score_std={alpha_stats['score_std']:.8f} "
                 f"score_abs_mean={alpha_stats['score_abs_mean']:.8f} "
@@ -1339,17 +1400,14 @@ class MetaExpertAggregator:
             )
 
     # --------------------------------------------------------
-    # 5.20 记录最终 alpha 的诊断信息
+    # 5.22 记录最终 alpha 的诊断信息
     # --------------------------------------------------------
     def log_meta_final_diagnostics(self, alpha_stats):
         """
         记录元网络更新完成后，最终 alpha 的诊断信息。
         """
 
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        self.ensure_log_dir()
 
         with open(self.train_log_path, "a", encoding="utf-8") as f:
             f.write(
@@ -1364,7 +1422,7 @@ class MetaExpertAggregator:
             )
 
     # --------------------------------------------------------
-    # 5.21 元网络输出 alpha
+    # 5.23 元网络输出 alpha
     # --------------------------------------------------------
     def compute_alpha(
         self,
@@ -1379,6 +1437,11 @@ class MetaExpertAggregator:
     ):
         """
         用元网络计算 expert 聚合权重 alpha。
+
+        当前仍然使用：
+            alpha = softmax(score / tau)
+
+        不加 prior。
         """
 
         features = self.build_meta_features(
@@ -1431,7 +1494,56 @@ class MetaExpertAggregator:
         return alpha
 
     # --------------------------------------------------------
-    # 5.22 根据 alpha 构造聚合后的 state_dict
+    # 5.24 直接质量 meta loss
+    # --------------------------------------------------------
+    def compute_alpha_quality_meta_loss(
+        self,
+        alpha,
+        derived_feature_cache,
+    ):
+        """
+        计算短链条 meta loss。
+
+        质量目标：
+            val_delta_dot_z 越大，说明 client-expert 更新越可能降低 val loss。
+
+        因此定义：
+            q = - val_delta_dot_z
+
+        meta loss:
+            L_meta = mean_e sum_i alpha[e, i] * q[e, i]
+
+        最小化该 loss 会推动：
+            q 小，也就是 val_delta_dot_z 大的 client-expert 获得更大 alpha。
+        """
+
+        if "val_delta_dot_z" not in derived_feature_cache:
+            raise ValueError(
+                "直接质量 meta loss 需要 val_delta_dot_z，"
+                "但 derived_feature_cache 中没有找到。"
+            )
+
+        val_delta_dot_z = derived_feature_cache["val_delta_dot_z"].detach()
+
+        q_target = -val_delta_dot_z
+
+        if alpha.shape != q_target.shape:
+            raise ValueError(
+                f"alpha 和 q_target shape 不一致: "
+                f"alpha={alpha.shape}, q_target={q_target.shape}"
+            )
+
+        loss_per_expert = torch.sum(
+            alpha * q_target,
+            dim=1,
+        )
+
+        meta_loss = loss_per_expert.mean()
+
+        return meta_loss
+
+    # --------------------------------------------------------
+    # 5.25 根据 alpha 构造聚合后的 state_dict
     # --------------------------------------------------------
     def build_aggregated_state_dict(
         self,
@@ -1509,14 +1621,15 @@ class MetaExpertAggregator:
         return new_state_dict
 
     # --------------------------------------------------------
-    # 5.23 在 server validation set 上计算 CE loss
+    # 5.26 保留旧 CE 计算函数，当前版本不用于更新 meta_net
     # --------------------------------------------------------
     def compute_validation_loss(self, model, temp_state_dict, val_loader):
         """
         用临时聚合参数在 server validation set 上计算 CE loss。
 
         注意：
-            这个函数用于训练 meta_net，不能加 torch.no_grad()。
+            当前版本已经不再用这个 loss 更新 meta_net。
+            保留该函数只是为了后续需要时方便对比。
         """
 
         model.eval()
@@ -1553,7 +1666,7 @@ class MetaExpertAggregator:
         return avg_loss
 
     # --------------------------------------------------------
-    # 5.24 主函数：更新元网络并返回最终聚合模型
+    # 5.27 主函数：更新元网络并返回最终聚合模型
     # --------------------------------------------------------
     def aggregate(
         self,
@@ -1568,6 +1681,16 @@ class MetaExpertAggregator:
     ):
         """
         元网络专家聚合主入口。
+
+        当前版本 meta 更新逻辑：
+
+            1. 计算 val_delta_dot_z
+            2. q = - val_delta_dot_z
+            3. alpha = softmax(score / tau)
+            4. meta_loss = mean_e sum_i alpha[e,i] * q[e,i]
+            5. 用 meta_loss 更新 meta_net
+            6. 用更新后的 meta_net 输出最终 alpha
+            7. 用最终 alpha 聚合 expert 参数
         """
 
         model.to(self.device)
@@ -1603,6 +1726,10 @@ class MetaExpertAggregator:
             derived_feature_cache=derived_feature_cache,
         )
 
+        self.log_meta_quality_target(
+            derived_feature_cache=derived_feature_cache,
+        )
+
         meta_loss_value = None
 
         for step_id in range(1, self.meta_steps + 1):
@@ -1619,18 +1746,9 @@ class MetaExpertAggregator:
                 return_stats=True,
             )
 
-            temp_state_dict = self.build_aggregated_state_dict(
-                client_state_dicts=client_state_dicts,
-                client_num_samples=client_num_samples,
-                non_expert_agg=non_expert_agg,
+            meta_loss = self.compute_alpha_quality_meta_loss(
                 alpha=alpha,
-                device=self.device,
-            )
-
-            meta_loss = self.compute_validation_loss(
-                model=model,
-                temp_state_dict=temp_state_dict,
-                val_loader=val_loader,
+                derived_feature_cache=derived_feature_cache,
             )
 
             meta_loss.backward()
