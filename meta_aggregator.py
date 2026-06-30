@@ -2,68 +2,46 @@
 # ------------------------------------------------------------
 # 元网络专家聚合模块
 #
-# 当前支持通过 config.yaml 控制元网络输入特征：
+# 本版改成 MPSL-style expert meta aggregation：
 #
-# meta:
-#   input_features:
-#     - expert_loss_z
-#     - delta_norm_z
+# 1. 元网络结构：
+#       MetaDeepSetWeightNet
 #
-# 当前支持八个输入特征：
-#   loss_z:
-#       标准化客户端训练 loss。
+#       对每个 expert e：
+#           输入该 expert 下所有 client 的特征 [C, input_dim]
+#           每个 client 独立编码
+#           求 client 集合的 global context
+#           拼接个体特征和 global context
+#           输出每个 client 的 score
+#           softmax(score / tau) 得到 alpha_e
 #
-#   sample_ratio:
-#       当前客户端样本数占比。
+# 2. 元训练目标：
+#       不再用“临时聚合模型 CE loss”训练元网络。
 #
-#   expert_freq:
-#       当前客户端上当前 expert 的激活频率。
+#       改成短链条 alignment proxy：
 #
-#   expert_loss_z:
-#       当前客户端当前 expert 对应样本平均 CE loss 的标准化值。
+#           alignment_{e,i} = val_delta_dot_z_{e,i}
 #
-#   delta_norm_z:
-#       当前客户端当前 expert 参数更新幅度的标准化值。
+#           meta_loss = - mean_e sum_i alpha_{e,i} * alignment_{e,i}
 #
-#   expert_count_log_z:
-#       log(1 + num_samples_i * expert_freq_{i,e}) 后再做 z-score。
-#       表示 client i 的 expert e 实际训练支撑量。
+#       含义：
+#           val_delta_dot_z 越大，说明 client i 的 expert e 更新
+#           越可能降低 server validation loss。
 #
-#   grad_cos_z:
-#       client expert 更新方向 Δθ_{i,e}
-#       和 server meta-val 梯度下降方向 -g_e 的余弦相似度，
-#       再做 z-score。
+#           最小化 meta_loss 会推动元网络给 alignment 高的 client-expert
+#           更大的 alpha。
 #
-#   val_delta_dot_z:
-#       - <g_e, Δθ_{i,e}> 后再做 z-score。
-#       表示一阶近似下该 client expert 更新能否降低 meta-val loss。
+# 3. 稳定机制：
+#       更新完 meta_net 后，重新计算 alpha。
 #
-# 当前元网络结构：
-#   原始共享 MLP:
-#       Linear(input_dim, hidden_dim)
-#       ReLU
-#       Linear(hidden_dim, 1)
+#       然后做：
+#           - min weight clamp
+#           - fairness blend
 #
-# 本版核心改动：
-#   原来 meta loss:
-#       用 alpha 聚合临时模型
-#       在 server validation set 上算 CE loss
-#       用 CE loss 更新 meta_net
+#       这样避免 alpha 过尖，防止某些客户端长期被压死。
 #
-#   现在 meta loss:
-#       先计算每个 client-expert 的质量目标：
-#           q_{e,i} = - val_delta_dot_z_{e,i}
-#
-#       然后直接用：
-#           L_meta = mean_e sum_i alpha_{e,i} * q_{e,i}
-#
-#   这样缩短了梯度链条：
-#       meta_net -> score -> alpha -> q loss
-#
-#   注意：
-#       本版不加 expert_count_prior。
-#       alpha 仍然是：
-#           alpha = softmax(score / tau)
+# 4. 本版仍然不加 expert_count_prior：
+#       alpha = softmax(score / tau)
 # ------------------------------------------------------------
 
 import os
@@ -73,7 +51,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.func import functional_call
 
 from model import is_expert_param
 
@@ -175,67 +152,91 @@ def counts_to_frequency(expert_counts):
 
 
 # ------------------------------------------------------------
-# 4. 元网络：原始共享 MLP
+# 4. MPSL-style DeepSet 元网络
 # ------------------------------------------------------------
-class MetaWeightNet(nn.Module):
+class MetaDeepSetWeightNet(nn.Module):
     """
-    元网络。
+    MPSL-style DeepSet 元网络。
 
     输入：
-        x:
-            shape = [N, input_dim]
+        features:
+            shape = [num_experts, num_clients, input_dim]
 
     输出：
-        score:
-            shape = [N]
+        scores:
+            shape = [num_experts, num_clients]
 
-    当前结构：
-        Linear -> ReLU -> Linear
-
-    注意：
-        这是共享 MLP。
-        所有 expert / client pair 共用同一个打分网络。
+    逻辑：
+        对每个 expert e：
+            1. 每个 client 特征独立经过 encoder
+            2. 对所有 client hidden 求 mean，得到 global context
+            3. 每个 client hidden 拼接 global context
+            4. decoder 输出 score
     """
 
-    def __init__(self, input_dim, hidden_dim=32):
+    def __init__(self, input_dim, hidden_dim=64):
         super().__init__()
 
         if input_dim <= 0:
-            raise ValueError("MetaWeightNet 的 input_dim 必须大于 0")
+            raise ValueError("MetaDeepSetWeightNet 的 input_dim 必须大于 0")
 
         self.input_dim = input_dim
 
-        self.net = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x):
+    def forward(self, features):
         """
-        x:
-            shape: [N, input_dim]
+        features:
+            [num_experts, num_clients, input_dim]
 
         return:
-            score:
-                shape: [N]
+            scores:
+                [num_experts, num_clients]
         """
 
-        if x.dim() != 2:
+        if features.dim() != 3:
             raise ValueError(
-                "MetaWeightNet 输入 x 应该是二维，"
-                f"shape=[N, input_dim]，实际是 {x.shape}"
+                "MetaDeepSetWeightNet 输入 features 应该是三维，"
+                f"shape=[num_experts, num_clients, input_dim]，实际是 {features.shape}"
             )
 
-        if x.size(1) != self.input_dim:
+        if features.size(-1) != self.input_dim:
             raise ValueError(
-                f"MetaWeightNet 输入维度不一致: "
-                f"x.input_dim={x.size(1)}, self.input_dim={self.input_dim}"
+                f"MetaDeepSetWeightNet 输入维度不一致: "
+                f"features.input_dim={features.size(-1)}, self.input_dim={self.input_dim}"
             )
 
-        score = self.net(x).squeeze(-1)
+        # [E, C, D] -> [E, C, H]
+        encoded = self.encoder(features)
 
-        return score
+        # 每个 expert 内，对所有 client 求 global context
+        # [E, C, H] -> [E, 1, H]
+        global_context = encoded.mean(dim=1, keepdim=True)
+
+        # [E, 1, H] -> [E, C, H]
+        global_context = global_context.expand_as(encoded)
+
+        # [E, C, 2H]
+        combined = torch.cat(
+            [encoded, global_context],
+            dim=-1,
+        )
+
+        # [E, C, 1] -> [E, C]
+        scores = self.decoder(combined).squeeze(-1)
+
+        return scores
 
 
 # ------------------------------------------------------------
@@ -246,19 +247,19 @@ class MetaExpertAggregator:
     元网络专家聚合器。
 
     它负责：
-        1. 根据客户端统计特征生成 alpha
-        2. 计算 client-expert 质量目标 q
-        3. 用 alpha 和 q 直接计算 meta loss
-        4. 用 meta loss 更新元网络
-        5. 用更新后的元网络输出最终 alpha
-        6. 返回最终聚合后的完整 state_dict
+        1. 根据客户端 expert 特征生成 alpha
+        2. 计算 val_delta_dot_z 作为 alignment score
+        3. 用 -alpha * alignment 训练元网络
+        4. 更新后重新计算 alpha
+        5. 对最终 alpha 做 min weight clamp / fairness blend
+        6. 用最终 alpha 聚合 expert 参数
     """
 
     def __init__(
         self,
         num_experts,
         device,
-        hidden_dim=32,
+        hidden_dim=64,
         lr=1e-3,
         meta_steps=1,
         max_val_batches=4,
@@ -268,6 +269,8 @@ class MetaExpertAggregator:
         active_mask=False,
         active_threshold=0.0,
         min_active_clients_per_expert=2,
+        min_weight_ratio=0.3,
+        fairness_blend=0.25,
     ):
         self.num_experts = num_experts
         self.device = device
@@ -291,10 +294,11 @@ class MetaExpertAggregator:
 
         self.min_active_clients_per_expert = int(min_active_clients_per_expert)
 
+        # MPSL-style 第一版建议只用 expert_loss_z。
+        # 这样更接近原代码：元网络输入 loss 向量，alignment 只作为训练目标。
         if input_features is None:
             input_features = [
                 "expert_loss_z",
-                "delta_norm_z",
             ]
 
         allowed_features = {
@@ -311,7 +315,7 @@ class MetaExpertAggregator:
         if not isinstance(input_features, (list, tuple)):
             raise TypeError(
                 "meta.input_features 必须是 list，例如："
-                "['expert_loss_z', 'delta_norm_z']"
+                "['expert_loss_z']"
             )
 
         input_features = list(input_features)
@@ -332,7 +336,7 @@ class MetaExpertAggregator:
 
         self.input_feature_names = input_features
 
-        self.meta_net = MetaWeightNet(
+        self.meta_net = MetaDeepSetWeightNet(
             input_dim=len(self.input_feature_names),
             hidden_dim=hidden_dim,
         ).to(device)
@@ -350,6 +354,21 @@ class MetaExpertAggregator:
             )
 
         self.train_log_path = train_log_path
+
+        # MPSL-style 稳定机制。
+        # min_weight_ratio=0.3 表示每个 client 的最小权重是 uniform 的 30%。
+        self.min_weight_ratio = float(min_weight_ratio)
+        self.fairness_blend = float(fairness_blend)
+
+        if self.min_weight_ratio < 0:
+            raise ValueError(
+                f"min_weight_ratio 不能小于 0，当前值为 {self.min_weight_ratio}"
+            )
+
+        if not (0.0 <= self.fairness_blend <= 1.0):
+            raise ValueError(
+                f"fairness_blend 必须在 [0, 1]，当前值为 {self.fairness_blend}"
+            )
 
     # --------------------------------------------------------
     # 5.1 日志目录
@@ -775,7 +794,8 @@ class MetaExpertAggregator:
 
         if val_loader is None:
             raise ValueError(
-                "直接质量 meta loss 需要 val_loader，用来计算 val_delta_dot_z。"
+                "MPSL-style alignment meta loss 需要 val_loader，"
+                "用来计算 val_delta_dot_z。"
             )
 
         model.to(self.device)
@@ -875,12 +895,12 @@ class MetaExpertAggregator:
 
         if client_state_dicts is None:
             raise ValueError(
-                "使用直接质量 meta loss 时，必须传入 client_state_dicts。"
+                "使用 MPSL-style alignment meta loss 时，必须传入 client_state_dicts。"
             )
 
         if global_state_dict is None:
             raise ValueError(
-                "使用直接质量 meta loss 时，必须传入 global_state_dict。"
+                "使用 MPSL-style alignment meta loss 时，必须传入 global_state_dict。"
             )
 
         if len(client_state_dicts) != num_clients:
@@ -983,7 +1003,7 @@ class MetaExpertAggregator:
         构造派生特征缓存。
 
         注意：
-            本版直接质量 meta loss 必须使用 val_delta_dot_z 作为 q 目标。
+            本版 MPSL-style alignment meta loss 必须使用 val_delta_dot_z。
             因此无论 input_features 是否包含 val_delta_dot_z，
             都会计算 direction_features。
         """
@@ -1282,19 +1302,19 @@ class MetaExpertAggregator:
             f.write(f"[META_INPUT_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.19 把 q 目标写入 train.log，不打印到控制台
+    # 5.19 把 alignment 目标写入 train.log，不打印到控制台
     # --------------------------------------------------------
-    def log_meta_quality_target(
+    def log_meta_alignment_target(
         self,
         derived_feature_cache,
     ):
         """
-        记录 q 目标到 train.log。
+        记录 alignment 目标到 train.log。
 
-        q = - val_delta_dot_z
+        alignment = val_delta_dot_z
 
         val_delta_dot_z 越大，说明越可能降低 validation loss；
-        因此 q 越小越好。
+        因此 alignment 越大越好。
         """
 
         self.ensure_log_dir()
@@ -1303,25 +1323,23 @@ class MetaExpertAggregator:
             raise ValueError("derived_feature_cache 缺少 val_delta_dot_z")
 
         val_delta_dot_z = derived_feature_cache["val_delta_dot_z"].detach().cpu()
-        q_target = -val_delta_dot_z
 
         with open(self.train_log_path, "a", encoding="utf-8") as f:
-            f.write(f"[META_Q_BEGIN] round={self.round_id}\n")
+            f.write(f"[META_ALIGNMENT_BEGIN] round={self.round_id}\n")
 
-            num_experts, num_clients = q_target.shape
+            num_experts, num_clients = val_delta_dot_z.shape
 
             for expert_id in range(num_experts):
                 for client_id in range(num_clients):
                     f.write(
-                        f"[META_Q] "
+                        f"[META_ALIGNMENT] "
                         f"round={self.round_id} "
                         f"expert={expert_id} "
                         f"client={client_id} "
-                        f"val_delta_dot_z={val_delta_dot_z[expert_id, client_id].item():.8f} "
-                        f"q={q_target[expert_id, client_id].item():.8f}\n"
+                        f"val_delta_dot_z={val_delta_dot_z[expert_id, client_id].item():.8f}\n"
                     )
 
-            f.write(f"[META_Q_END] round={self.round_id}\n")
+            f.write(f"[META_ALIGNMENT_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
     # 5.20 把最终聚合权重 alpha 写入 train.log，不打印到控制台
@@ -1387,7 +1405,7 @@ class MetaExpertAggregator:
                 f"[META_DIAG] "
                 f"round={self.round_id} "
                 f"step={step_id} "
-                f"meta_objective=alpha_quality "
+                f"meta_objective=mpsl_alignment "
                 f"meta_loss={meta_loss_value:.8f} "
                 f"score_std={alpha_stats['score_std']:.8f} "
                 f"score_abs_mean={alpha_stats['score_abs_mean']:.8f} "
@@ -1436,7 +1454,7 @@ class MetaExpertAggregator:
         return_stats=False,
     ):
         """
-        用元网络计算 expert 聚合权重 alpha。
+        用 MPSL-style DeepSet 元网络计算 expert 聚合权重 alpha。
 
         当前仍然使用：
             alpha = softmax(score / tau)
@@ -1454,19 +1472,15 @@ class MetaExpertAggregator:
             derived_feature_cache=derived_feature_cache,
         )
 
-        num_experts, num_clients, input_dim = features.shape
+        scores = self.meta_net(features)
 
-        flat_features = features.reshape(
-            num_experts * num_clients,
-            input_dim,
-        )
+        num_experts, num_clients = scores.shape
 
-        flat_scores = self.meta_net(flat_features)
-
-        scores = flat_scores.reshape(
-            num_experts,
-            num_clients,
-        )
+        if num_experts != self.num_experts:
+            raise ValueError(
+                f"meta_net 输出 expert 数量不一致: "
+                f"scores.num_experts={num_experts}, self.num_experts={self.num_experts}"
+            )
 
         if self.active_mask:
             active_mask = self.build_active_mask(
@@ -1489,61 +1503,176 @@ class MetaExpertAggregator:
                 alpha=alpha,
             )
 
-            return alpha, stats
+            return alpha, scores, stats
 
         return alpha
 
     # --------------------------------------------------------
-    # 5.24 直接质量 meta loss
+    # 5.24 MPSL-style alignment meta loss
     # --------------------------------------------------------
-    def compute_alpha_quality_meta_loss(
+    def compute_alignment_meta_loss(
         self,
         alpha,
         derived_feature_cache,
     ):
         """
-        计算短链条 meta loss。
+        计算 MPSL-style 短链条 meta loss。
 
-        质量目标：
+        alignment:
             val_delta_dot_z 越大，说明 client-expert 更新越可能降低 val loss。
 
-        因此定义：
-            q = - val_delta_dot_z
-
         meta loss:
-            L_meta = mean_e sum_i alpha[e, i] * q[e, i]
+            L_meta = - mean_e sum_i alpha[e, i] * alignment[e, i]
 
         最小化该 loss 会推动：
-            q 小，也就是 val_delta_dot_z 大的 client-expert 获得更大 alpha。
+            alignment 高的 client-expert 获得更大 alpha。
         """
 
         if "val_delta_dot_z" not in derived_feature_cache:
             raise ValueError(
-                "直接质量 meta loss 需要 val_delta_dot_z，"
+                "MPSL-style alignment meta loss 需要 val_delta_dot_z，"
                 "但 derived_feature_cache 中没有找到。"
             )
 
-        val_delta_dot_z = derived_feature_cache["val_delta_dot_z"].detach()
+        alignment_scores = derived_feature_cache["val_delta_dot_z"].detach()
 
-        q_target = -val_delta_dot_z
-
-        if alpha.shape != q_target.shape:
+        if alpha.shape != alignment_scores.shape:
             raise ValueError(
-                f"alpha 和 q_target shape 不一致: "
-                f"alpha={alpha.shape}, q_target={q_target.shape}"
+                f"alpha 和 alignment_scores shape 不一致: "
+                f"alpha={alpha.shape}, alignment={alignment_scores.shape}"
             )
 
-        loss_per_expert = torch.sum(
-            alpha * q_target,
+        score_per_expert = torch.sum(
+            alpha * alignment_scores,
             dim=1,
         )
 
-        meta_loss = loss_per_expert.mean()
+        meta_loss = -score_per_expert.mean()
 
         return meta_loss
 
     # --------------------------------------------------------
-    # 5.25 根据 alpha 构造聚合后的 state_dict
+    # 5.25 生成 fairness 权重
+    # --------------------------------------------------------
+    def build_fairness_weights(
+        self,
+        client_expert_losses,
+        alpha,
+    ):
+        """
+        构造 fairness 权重。
+
+        参考 MPSL 代码的公平性混合思想：
+            loss 高的客户端给一点补偿权重。
+
+        对你的 expert 聚合场景：
+            对每个 expert e，在 client 维度按 raw expert loss 归一化。
+
+        输入：
+            client_expert_losses: [C, E]
+            alpha: [E, C]
+
+        输出：
+            fairness_weights: [E, C]
+        """
+
+        if client_expert_losses is None:
+            return None
+
+        losses = torch.as_tensor(
+            client_expert_losses,
+            dtype=torch.float32,
+            device=alpha.device,
+        )
+
+        if losses.dim() != 2:
+            raise ValueError(
+                "client_expert_losses 应该是二维，shape=[num_clients, num_experts]"
+            )
+
+        if losses.shape[1] != self.num_experts:
+            raise ValueError(
+                f"client_expert_losses 的 expert 数量不一致: "
+                f"losses.shape={losses.shape}, num_experts={self.num_experts}"
+            )
+
+        # [C, E] -> [E, C]
+        losses = losses.transpose(0, 1)
+
+        losses = losses.clamp_min(0.0)
+
+        denom = losses.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        fairness_weights = losses / denom
+
+        if fairness_weights.shape != alpha.shape:
+            raise ValueError(
+                f"fairness_weights 和 alpha shape 不一致: "
+                f"fairness={fairness_weights.shape}, alpha={alpha.shape}"
+            )
+
+        return fairness_weights
+
+    # --------------------------------------------------------
+    # 5.26 最终 alpha 稳定化
+    # --------------------------------------------------------
+    def stabilize_final_alpha(
+        self,
+        alpha,
+        client_expert_losses=None,
+    ):
+        """
+        对最终 alpha 做稳定化。
+
+        1. min weight clamp：
+            每个 client 的权重至少是 uniform 的 min_weight_ratio 倍。
+
+        2. fairness blend：
+            和 expert_loss-based fairness 权重混合，
+            避免困难客户端长期被压低。
+        """
+
+        alpha = alpha.clone()
+
+        num_clients = alpha.size(1)
+
+        if self.min_weight_ratio > 0:
+            min_weight = self.min_weight_ratio * (1.0 / num_clients)
+
+            alpha = torch.clamp(
+                alpha,
+                min=min_weight,
+            )
+
+            alpha = alpha / alpha.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-12)
+
+        if self.fairness_blend > 0:
+            fairness_weights = self.build_fairness_weights(
+                client_expert_losses=client_expert_losses,
+                alpha=alpha,
+            )
+
+            if fairness_weights is not None:
+                alpha = (
+                    (1.0 - self.fairness_blend) * alpha
+                    + self.fairness_blend * fairness_weights
+                )
+
+                alpha = alpha / alpha.sum(
+                    dim=1,
+                    keepdim=True,
+                ).clamp_min(1e-12)
+
+        return alpha
+
+    # --------------------------------------------------------
+    # 5.27 根据 alpha 构造聚合后的 state_dict
     # --------------------------------------------------------
     def build_aggregated_state_dict(
         self,
@@ -1621,52 +1750,7 @@ class MetaExpertAggregator:
         return new_state_dict
 
     # --------------------------------------------------------
-    # 5.26 保留旧 CE 计算函数，当前版本不用于更新 meta_net
-    # --------------------------------------------------------
-    def compute_validation_loss(self, model, temp_state_dict, val_loader):
-        """
-        用临时聚合参数在 server validation set 上计算 CE loss。
-
-        注意：
-            当前版本已经不再用这个 loss 更新 meta_net。
-            保留该函数只是为了后续需要时方便对比。
-        """
-
-        model.eval()
-
-        criterion = nn.CrossEntropyLoss()
-
-        total_loss = 0.0
-        total_samples = 0
-
-        for batch_id, (images, labels) in enumerate(val_loader):
-            if batch_id >= self.max_val_batches:
-                break
-
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-
-            logits = functional_call(
-                model,
-                temp_state_dict,
-                (images,),
-            )
-
-            loss = criterion(logits, labels)
-
-            batch_size = images.size(0)
-            total_loss = total_loss + loss * batch_size
-            total_samples += batch_size
-
-        if total_samples == 0:
-            raise ValueError("server validation loader 为空，无法计算 meta loss")
-
-        avg_loss = total_loss / total_samples
-
-        return avg_loss
-
-    # --------------------------------------------------------
-    # 5.27 主函数：更新元网络并返回最终聚合模型
+    # 5.28 主函数：更新元网络并返回最终聚合模型
     # --------------------------------------------------------
     def aggregate(
         self,
@@ -1685,12 +1769,13 @@ class MetaExpertAggregator:
         当前版本 meta 更新逻辑：
 
             1. 计算 val_delta_dot_z
-            2. q = - val_delta_dot_z
+            2. alignment = val_delta_dot_z
             3. alpha = softmax(score / tau)
-            4. meta_loss = mean_e sum_i alpha[e,i] * q[e,i]
+            4. meta_loss = - mean_e sum_i alpha[e,i] * alignment[e,i]
             5. 用 meta_loss 更新 meta_net
-            6. 用更新后的 meta_net 输出最终 alpha
-            7. 用最终 alpha 聚合 expert 参数
+            6. 更新后重新计算 alpha
+            7. 对最终 alpha 做 min weight clamp / fairness blend
+            8. 用最终 alpha 聚合 expert 参数
         """
 
         model.to(self.device)
@@ -1726,7 +1811,7 @@ class MetaExpertAggregator:
             derived_feature_cache=derived_feature_cache,
         )
 
-        self.log_meta_quality_target(
+        self.log_meta_alignment_target(
             derived_feature_cache=derived_feature_cache,
         )
 
@@ -1735,7 +1820,7 @@ class MetaExpertAggregator:
         for step_id in range(1, self.meta_steps + 1):
             self.optimizer.zero_grad()
 
-            alpha, alpha_stats = self.compute_alpha(
+            alpha, scores, alpha_stats = self.compute_alpha(
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
                 client_num_samples=client_num_samples,
@@ -1746,7 +1831,7 @@ class MetaExpertAggregator:
                 return_stats=True,
             )
 
-            meta_loss = self.compute_alpha_quality_meta_loss(
+            meta_loss = self.compute_alignment_meta_loss(
                 alpha=alpha,
                 derived_feature_cache=derived_feature_cache,
             )
@@ -1768,7 +1853,7 @@ class MetaExpertAggregator:
             self.optimizer.step()
 
         with torch.no_grad():
-            final_alpha, final_alpha_stats = self.compute_alpha(
+            final_alpha_raw, final_scores, _ = self.compute_alpha(
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
                 client_num_samples=client_num_samples,
@@ -1777,6 +1862,16 @@ class MetaExpertAggregator:
                 global_state_dict=global_state_dict,
                 derived_feature_cache=derived_feature_cache,
                 return_stats=True,
+            )
+
+            final_alpha = self.stabilize_final_alpha(
+                alpha=final_alpha_raw,
+                client_expert_losses=client_expert_losses,
+            )
+
+            final_alpha_stats = self.compute_alpha_stats(
+                scores=final_scores,
+                alpha=final_alpha,
             )
 
             self.log_meta_final_diagnostics(
