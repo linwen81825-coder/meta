@@ -952,12 +952,15 @@ def main():
             max_val_batches=meta_cfg.get("max_val_batches", 4),
             train_log_path=log_path,
             tau=meta_cfg.get("tau", 1.0),
+
+            # hard active mask：保留，但当前建议 False
             active_mask=meta_cfg.get("active_mask", False),
             active_threshold=meta_cfg.get("active_threshold", 0.0),
             min_active_clients_per_expert=meta_cfg.get(
                 "min_active_clients_per_expert",
                 2,
             ),
+
             input_features=meta_cfg.get(
                 "input_features",
                 [
@@ -966,6 +969,24 @@ def main():
                     "expert_freq",
                 ],
             ),
+
+            # 新增：score 标准化
+            score_norm=meta_cfg.get("score_norm", False),
+            score_norm_scale=meta_cfg.get("score_norm_scale", 0.5),
+
+            # 新增：soft reliability
+            soft_reliability=meta_cfg.get("soft_reliability", False),
+            reliability_threshold=meta_cfg.get("reliability_threshold", 0.05),
+            reliability_scale=meta_cfg.get("reliability_scale", 0.03),
+            reliability_beta=meta_cfg.get("reliability_beta", 0.5),
+
+            # 新增：alpha EMA
+            alpha_ema=meta_cfg.get("alpha_ema", False),
+            alpha_ema_beta=meta_cfg.get("alpha_ema_beta", 0.7),
+
+            # 新增：expert embedding
+            use_expert_embedding=meta_cfg.get("use_expert_embedding", False),
+            expert_embedding_dim=meta_cfg.get("expert_embedding_dim", 4),
         )
 
         print("已启用 expert_agg = meta_network")
@@ -989,21 +1010,31 @@ def main():
     if expert_agg == "meta_network":
         meta_cfg = cfg.get("meta", {})
         print("---------- Meta 配置 ----------")
-        print(f"meta.hidden_dim     : {meta_cfg.get('hidden_dim', 32)}")
-        print(f"meta.lr             : {meta_cfg.get('lr', 1e-3)}")
-        print(f"meta.steps          : {meta_cfg.get('steps', 1)}")
-        print(f"meta.tau            : {meta_cfg.get('tau', 1.0)}")
-        print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
-        print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
-        print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
+        print(f"meta.hidden_dim          : {meta_cfg.get('hidden_dim', 32)}")
+        print(f"meta.lr                  : {meta_cfg.get('lr', 1e-3)}")
+        print(f"meta.steps               : {meta_cfg.get('steps', 1)}")
+        print(f"meta.tau                 : {meta_cfg.get('tau', 1.0)}")
+        print(f"max_val_batches          : {meta_cfg.get('max_val_batches', 4)}")
+        print(f"meta.active_mask         : {meta_cfg.get('active_mask', False)}")
+        print(f"active_threshold         : {meta_cfg.get('active_threshold', 0.0)}")
+        print(f"meta.score_norm          : {meta_cfg.get('score_norm', False)}")
+        print(f"score_norm_scale         : {meta_cfg.get('score_norm_scale', 0.5)}")
+        print(f"meta.soft_reliability    : {meta_cfg.get('soft_reliability', False)}")
+        print(f"reliability_threshold    : {meta_cfg.get('reliability_threshold', 0.05)}")
+        print(f"reliability_scale        : {meta_cfg.get('reliability_scale', 0.03)}")
+        print(f"reliability_beta         : {meta_cfg.get('reliability_beta', 0.5)}")
+        print(f"meta.alpha_ema           : {meta_cfg.get('alpha_ema', False)}")
+        print(f"alpha_ema_beta           : {meta_cfg.get('alpha_ema_beta', 0.7)}")
+        print(f"meta.use_expert_embedding: {meta_cfg.get('use_expert_embedding', False)}")
+        print(f"expert_embedding_dim     : {meta_cfg.get('expert_embedding_dim', 4)}")
         print(
-            "min_active_clients : "
+            "min_active_clients       : "
             f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
         )
 
         if meta_aggregator is not None:
             input_features = ", ".join(meta_aggregator.input_feature_names)
-            print(f"meta.input_features : [{input_features}]")
+            print(f"meta.input_features      : [{input_features}]")
 
     print("==============================")
 

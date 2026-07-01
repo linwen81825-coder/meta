@@ -47,6 +47,16 @@ meta:
   active_mask: true
   active_threshold: 0.0
   min_active_clients_per_expert: 2
+  score_norm: true
+  score_norm_scale: 0.5
+  soft_reliability: true
+  reliability_threshold: 0.05
+  reliability_scale: 0.03
+  reliability_beta: 0.5
+  alpha_ema: true
+  alpha_ema_beta: 0.7
+  use_expert_embedding: true
+  expert_embedding_dim: 4
   
 aggregation:
   # non_expert_agg 支持：uniform / sample_weighted
