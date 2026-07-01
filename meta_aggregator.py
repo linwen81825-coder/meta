@@ -182,7 +182,6 @@ class MetaWeightNet(nn.Module):
         # 对每个 client-expert 特征做共享编码。
         # 这里不加 LayerNorm / BatchNorm / RMSNorm。
         self.encoder = nn.Sequential(
-            nn.LayerNorm(self.input_dim),
             nn.Linear(self.input_dim, self.hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -304,6 +303,8 @@ class MetaExpertAggregator:
             "expert_freq",
             "expert_loss_z",
             "delta_norm_z",
+            "loss_raw",
+            "expert_loss_raw",
         }
 
         if not isinstance(input_features, (list, tuple)):
@@ -396,7 +397,40 @@ class MetaExpertAggregator:
             num_clients,
         )
         return loss_z_feature
+    def build_loss_raw_feature(
+        self,
+        client_losses,
+        num_clients,
+    ):
+        """
+        构造 loss_raw 特征。
 
+        输入：
+            client_losses: [C]
+
+        输出：
+            loss_raw_feature: [E, C]
+
+        注意：
+            这里不做 z-score 标准化，直接使用客户端平均训练 loss。
+        """
+        losses = torch.as_tensor(
+            client_losses,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if losses.numel() != num_clients:
+            raise ValueError(
+                f"client_losses 数量不一致: "
+                f"losses={losses.numel()}, num_clients={num_clients}"
+            )
+
+        loss_raw_feature = losses.unsqueeze(0).expand(
+            self.num_experts,
+            num_clients,
+        )
+        return loss_raw_feature
     # --------------------------------------------------------
     # 5.3 特征：sample_ratio
     # --------------------------------------------------------
@@ -539,7 +573,58 @@ class MetaExpertAggregator:
 
         expert_loss_z = (expert_loss - loss_mean) / loss_std
         return expert_loss_z
+    
+    def build_expert_loss_raw_feature(
+        self,
+        client_expert_losses,
+        num_clients,
+    ):
+        """
+        构造 expert_loss_raw 特征。
 
+        输入：
+            client_expert_losses: shape: [num_clients, num_experts]
+
+        输出：
+            expert_loss_raw: shape: [num_experts, num_clients]
+
+        注意：
+            这里不做 z-score 标准化，直接使用每个 client-expert 的平均 CE loss。
+        """
+        if client_expert_losses is None:
+            raise ValueError(
+                "使用 expert_loss_raw 时，必须从 train.py 传入 client_expert_losses。"
+            )
+
+        expert_losses = torch.as_tensor(
+            client_expert_losses,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if expert_losses.dim() != 2:
+            raise ValueError(
+                "client_expert_losses 应该是二维，shape=[num_clients, num_experts]"
+            )
+
+        input_num_clients, input_num_experts = expert_losses.shape
+
+        if input_num_clients != num_clients:
+            raise ValueError(
+                f"client_expert_losses 客户端数量不一致: "
+                f"loss_clients={input_num_clients}, num_clients={num_clients}"
+            )
+
+        if input_num_experts != self.num_experts:
+            raise ValueError(
+                f"expert 数量不一致: 当前 aggregator num_experts={self.num_experts}, "
+                f"但是输入 expert_losses.shape={expert_losses.shape}"
+            )
+
+        # 原始输入 shape 是 [client, expert]
+        # 元网络需要 [expert, client]
+        expert_loss_raw = expert_losses.transpose(0, 1)
+        return expert_loss_raw
     # --------------------------------------------------------
     # 5.6 计算 expert delta norm
     # --------------------------------------------------------
@@ -676,6 +761,11 @@ class MetaExpertAggregator:
                     client_losses=client_losses,
                     num_clients=num_clients,
                 )
+            elif feature_name == "loss_raw":
+                feature = self.build_loss_raw_feature(
+                    client_losses=client_losses,
+                    num_clients=num_clients,
+                )
             elif feature_name == "sample_ratio":
                 feature = self.build_sample_ratio_feature(
                     client_num_samples=client_num_samples,
@@ -688,6 +778,11 @@ class MetaExpertAggregator:
                 )
             elif feature_name == "expert_loss_z":
                 feature = self.build_expert_loss_z_feature(
+                    client_expert_losses=client_expert_losses,
+                    num_clients=num_clients,
+                )
+            elif feature_name == "expert_loss_raw":
+                feature = self.build_expert_loss_raw_feature(
                     client_expert_losses=client_expert_losses,
                     num_clients=num_clients,
                 )

@@ -41,6 +41,8 @@ meta:
     - expert_freq
     - delta_norm_z
     - expert_loss_z
+    - loss_raw
+    - expert_loss_raw
   active_mask: true
   active_threshold: 0.0
   min_active_clients_per_expert: 2
