@@ -46,6 +46,11 @@ meta:
   active_mask: true
   active_threshold: 0.0
   min_active_clients_per_expert: 2
+  use_gradient_alignment: true
+  grad_probe_batches: 2
+  query_grad_batches: 2
+  grad_min_samples: 16
+  alignment_fallback: sample_weighted
   
 aggregation:
   # non_expert_agg 支持：uniform / sample_weighted
