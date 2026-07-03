@@ -2,26 +2,22 @@
 # ------------------------------------------------------------
 # 最小版 FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
 #
-# 当前支持：
-# 1. 从测试集划分 server validation set
-# 2. 客户端本地训练时统计：
-#    - client_loss
-#    - expert_activation_frequency
-#    - expert_loss
-# 3. 当 expert_agg = meta_network 时：
-#    - 调用 meta_aggregator.py 里的 MetaExpertAggregator
-#    - 用服务器验证集 loss 更新元网络
-#    - 再用元网络输出最终 expert 聚合权重
-# 4. 支持 router balance loss
-# 5. 支持 top-k routing，其中 top_k 从 config.yaml 的 model.top_k 读取
-# 6. 元网络输入特征由 meta.input_features 控制
-# 7. 支持 meta.tau，控制 softmax 输出 alpha 的尖锐程度
-# 8. 支持 active_mask，避免未激活 expert 的客户端参与该 expert 的权重归一化
+# 路径规则：
+# 1. CIFAR10 数据集固定放在当前项目目录 ./data
+# 2. torchvision 的 download=True 会自动判断：
+#    - 如果 ./data 里已有 CIFAR10，就直接加载
+#    - 如果没有，就自动下载
+# 3. config.yaml 里的 dataset.data_root 只作为日志目录
+# 4. 日志文件名自动取 data_root 的最后一级目录名
+#    例如：
+#       data_root: ./runs/b5f661
+#       log_path : ./runs/b5f661/b5f661.log
 # ------------------------------------------------------------
 
 import argparse
 import os
 import random
+import shutil
 import sys
 from datetime import datetime
 
@@ -29,12 +25,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 from model import ResNet18SwitchMoE, is_expert_param, print_trainable_param_stats
-
 from meta_aggregator import (
     MetaExpertAggregator,
     update_expert_counts,
@@ -43,7 +37,113 @@ from meta_aggregator import (
 
 
 # ------------------------------------------------------------
-# 0. 日志工具：同时打印到终端和保存到文件
+# 0. 路径工具
+# ------------------------------------------------------------
+def get_project_root():
+    """
+    当前项目根目录。
+
+    train.py 放在哪个目录，哪个目录就是项目根目录。
+    数据集固定放到：
+        项目根目录/data
+    """
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def make_abs_path(path, base_dir=None):
+    """
+    把路径转成绝对路径。
+
+    相对路径默认相对于当前项目根目录。
+    """
+    path = os.path.expanduser(str(path))
+
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+
+    if base_dir is None:
+        base_dir = get_project_root()
+
+    return os.path.abspath(os.path.join(base_dir, path))
+
+
+def get_fixed_dataset_root():
+    """
+    固定数据集目录。
+
+    不再从 config.yaml 读取数据集路径。
+    CIFAR10 永远固定在：
+        当前项目目录/data
+    """
+    return os.path.join(get_project_root(), "data")
+
+
+def get_log_root(cfg):
+    """
+    日志目录。
+
+    config.yaml 里的 dataset.data_root 现在只用来保存日志。
+    """
+    dataset_cfg = cfg.get("dataset", {})
+    log_root = dataset_cfg.get("data_root", "./runs/default")
+    log_root = make_abs_path(log_root)
+    os.makedirs(log_root, exist_ok=True)
+    return log_root
+
+
+def get_log_name_from_root(log_root):
+    """
+    根据日志目录自动生成日志文件名。
+
+    例如：
+        log_root = ./runs/b5f661
+    则：
+        log_name = b5f661.log
+    """
+    norm_root = os.path.normpath(log_root)
+    run_name = os.path.basename(norm_root)
+
+    if run_name == "":
+        run_name = "train"
+
+    return f"{run_name}.log"
+
+
+def get_log_path(cfg):
+    """
+    日志文件路径。
+
+    规则：
+        dataset.data_root 的最后一级目录名作为日志文件名。
+
+    例如：
+        dataset.data_root: ./runs/b5f661
+    则日志文件是：
+        ./runs/b5f661/b5f661.log
+    """
+    log_root = get_log_root(cfg)
+    log_name = get_log_name_from_root(log_root)
+    return os.path.join(log_root, log_name)
+
+
+def copy_config_to_log_root(config_path, cfg):
+    """
+    把本次使用的 config.yaml 复制到日志目录。
+    """
+    if config_path is None:
+        return None
+
+    if not os.path.isfile(config_path):
+        return None
+
+    log_root = get_log_root(cfg)
+    dst_path = os.path.join(log_root, "config_used.yaml")
+    shutil.copy2(config_path, dst_path)
+    return dst_path
+
+
+# ------------------------------------------------------------
+# 1. 日志工具：同时打印到终端和保存到文件
 # ------------------------------------------------------------
 class TeeLogger:
     """
@@ -57,7 +157,6 @@ class TeeLogger:
     def write(self, message):
         self.terminal.write(message)
         self.log_file.write(message)
-
         self.terminal.flush()
         self.log_file.flush()
 
@@ -66,86 +165,62 @@ class TeeLogger:
         self.log_file.flush()
 
 
-def get_log_path(cfg):
+def setup_logging(cfg, config_path=None):
     """
-    日志默认保存到：
-        dataset.data_root/logs/train.log
+    开启日志保存。
+
+    每次运行都会覆盖当前日志文件。
+    日志文件名由 dataset.data_root 的最后一级目录名自动决定。
+
+    同时在日志开头打印：
+        日志开始时间
+        日志保存路径
     """
-
-    data_root = cfg["dataset"].get("data_root", "./data")
-    log_dir = os.path.join(data_root, "logs")
-
-    os.makedirs(log_dir, exist_ok=True)
-
-    return os.path.join(log_dir, "train.log")
-
-
-def setup_logging(cfg):
-    """
-    开启自动日志保存。
-    """
-
     log_path = get_log_path(cfg)
 
-    log_file = open(log_path, "a", encoding="utf-8")
+    log_file = open(log_path, "w", encoding="utf-8")
 
     sys.stdout = TeeLogger(sys.__stdout__, log_file)
     sys.stderr = TeeLogger(sys.__stderr__, log_file)
 
-    print("\n" + "=" * 80)
+    copy_config_to_log_root(config_path, cfg)
+
+    # 为了日志里显示成 ./data/xxx/logs/train.log 这种相对路径
+    display_log_path = os.path.relpath(
+        log_path,
+        get_project_root(),
+    )
+
+    if not display_log_path.startswith("."):
+        display_log_path = f"./{display_log_path}"
+
+    print("=" * 80)
     print(f"日志开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"日志保存路径: {log_path}")
+    print(f"日志保存路径: {display_log_path}")
     print("=" * 80)
 
     return log_path
 
 
-def run_without_file_logging(func, *args, **kwargs):
-    """
-    临时关闭 TeeLogger，只把输出显示到控制台，不写入 train.log。
-
-    用途：
-        torchvision 下载 CIFAR10 时会显示进度条。
-        如果不临时关闭日志，进度条会被写进 train.log，导致日志很乱。
-    """
-
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
-
-    try:
-        result = func(*args, **kwargs)
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-
-    return result
-
-
 # ------------------------------------------------------------
-# 1. 读取配置文件
+# 2. 读取配置文件
 # ------------------------------------------------------------
 def load_config(config_path):
     """
     读取 config.yaml。
     """
-
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-
     return cfg
 
 
 # ------------------------------------------------------------
-# 2. 固定随机种子
+# 3. 固定随机种子
 # ------------------------------------------------------------
 def set_seed(seed):
     """
     固定随机种子。
     """
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -153,13 +228,12 @@ def set_seed(seed):
 
 
 # ------------------------------------------------------------
-# 3. 选择设备
+# 4. 选择设备
 # ------------------------------------------------------------
 def get_device(cfg):
     """
     根据配置选择 cuda 或 cpu。
     """
-
     device_name = cfg.get("device", "cuda")
 
     if device_name == "cuda" and torch.cuda.is_available():
@@ -169,13 +243,12 @@ def get_device(cfg):
 
 
 # ------------------------------------------------------------
-# 4. 构建模型
+# 5. 构建模型
 # ------------------------------------------------------------
 def build_model(cfg):
     """
     创建 ResNet18SwitchMoE 模型。
     """
-
     model_cfg = cfg["model"]
     dataset_cfg = cfg["dataset"]
 
@@ -190,16 +263,27 @@ def build_model(cfg):
 
 
 # ------------------------------------------------------------
-# 5. 加载 CIFAR10 数据集
+# 6. 加载 CIFAR10 数据集
 # ------------------------------------------------------------
 def build_datasets(cfg):
     """
     加载 CIFAR10 训练集和测试集。
-    """
 
+    数据集固定在项目目录 ./data。
+
+    download=True 不等于每次都下载。
+    torchvision 会自动判断数据是否已经存在：
+        已存在：直接加载
+        不存在：自动下载
+    """
     dataset_cfg = cfg["dataset"]
-    data_root = dataset_cfg.get("data_root", "./data")
-    download_flag = dataset_cfg.get("download", True)
+
+    dataset_name = dataset_cfg.get("name", "cifar10").lower()
+    if dataset_name != "cifar10":
+        raise ValueError(f"当前代码只支持 cifar10，收到 dataset.name={dataset_name}")
+
+    data_root = get_fixed_dataset_root()
+    os.makedirs(data_root, exist_ok=True)
 
     normalize = transforms.Normalize(
         mean=(0.4914, 0.4822, 0.4465),
@@ -219,14 +303,14 @@ def build_datasets(cfg):
     train_set = datasets.CIFAR10(
         root=data_root,
         train=True,
-        download=download_flag,
+        download=True,
         transform=train_transform,
     )
 
     test_set = datasets.CIFAR10(
         root=data_root,
         train=False,
-        download=download_flag,
+        download=True,
         transform=test_transform,
     )
 
@@ -234,24 +318,22 @@ def build_datasets(cfg):
 
 
 # ------------------------------------------------------------
-# 6. 从测试集划分 class-balanced server validation set
+# 7. 从测试集划分 class-balanced server validation set
 # ------------------------------------------------------------
 def split_server_validation_from_test_set(test_set, cfg, seed):
     """
     从 CIFAR10 测试集中划出服务器验证集。
 
     当前数据流：
-        train_set 全部用于客户端训练；
-        test_set 先划出 server validation set；
-        剩下的 test_set 用于最终测试。
+    train_set 全部用于客户端训练；
+    test_set 先划出 server validation set；
+    剩下的 test_set 用于最终测试。
     """
-
     server_cfg = cfg.get("server", {})
     dataset_cfg = cfg["dataset"]
 
     val_size = server_cfg.get("val_size", 1000)
     num_classes = dataset_cfg["num_classes"]
-
     total_size = len(test_set)
 
     if val_size <= 0:
@@ -300,22 +382,21 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
 
     print("========== Server 验证集划分 ==========")
     print("划分来源: CIFAR10 test set")
-    print(f"server val samples       : {len(server_val_set)}")
-    print(f"final test samples       : {len(final_test_set)}")
-    print(f"server val per class     : {samples_per_class}")
+    print(f"server val samples : {len(server_val_set)}")
+    print(f"final test samples : {len(final_test_set)}")
+    print(f"server val per class : {samples_per_class}")
     print("======================================")
 
     return server_val_set, final_test_set
 
 
 # ------------------------------------------------------------
-# 7. Dirichlet non-IID 客户端划分
+# 8. Dirichlet non-IID 客户端划分
 # ------------------------------------------------------------
 def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
     """
     用 Dirichlet 分布划分 non-IID 客户端数据。
     """
-
     rng = np.random.default_rng(seed)
     labels = np.array(labels)
     num_classes = int(labels.max()) + 1
@@ -327,9 +408,7 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
             class_indices = np.where(labels == class_id)[0]
             rng.shuffle(class_indices)
 
-            proportions = rng.dirichlet(
-                alpha * np.ones(num_clients)
-            )
+            proportions = rng.dirichlet(alpha * np.ones(num_clients))
 
             split_points = (
                 np.cumsum(proportions)[:-1] * len(class_indices)
@@ -352,13 +431,12 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
 
 
 # ------------------------------------------------------------
-# 8. 构建每个客户端的 DataLoader
+# 9. 构建每个客户端的 DataLoader
 # ------------------------------------------------------------
 def build_client_loaders(train_set, client_indices, cfg, device):
     """
     根据客户端样本索引，构建每个客户端自己的 DataLoader。
     """
-
     train_cfg = cfg["train"]
 
     batch_size = train_cfg["batch_size"]
@@ -384,13 +462,12 @@ def build_client_loaders(train_set, client_indices, cfg, device):
 
 
 # ------------------------------------------------------------
-# 9. 构建 server validation DataLoader
+# 10. 构建 server validation DataLoader
 # ------------------------------------------------------------
 def build_server_val_loader(server_val_set, cfg, device):
     """
     构建服务器验证集 DataLoader。
     """
-
     if server_val_set is None:
         return None
 
@@ -417,13 +494,12 @@ def build_server_val_loader(server_val_set, cfg, device):
 
 
 # ------------------------------------------------------------
-# 10. 构建测试集 DataLoader
+# 11. 构建测试集 DataLoader
 # ------------------------------------------------------------
 def build_test_loader(test_set, cfg, device):
     """
     构建测试集 DataLoader。
     """
-
     train_cfg = cfg["train"]
 
     batch_size = train_cfg.get("test_batch_size", 256)
@@ -442,20 +518,17 @@ def build_test_loader(test_set, cfg, device):
 
 
 # ------------------------------------------------------------
-# 11. Router balance loss
+# 12. Router balance loss
 # ------------------------------------------------------------
 def compute_router_balance_loss(router_probs):
     """
     计算 router balance loss，缓解 expert 激活塌缩。
     """
-
     if router_probs.dim() == 3:
         num_experts = router_probs.size(-1)
         router_probs = router_probs.reshape(-1, num_experts)
-
     elif router_probs.dim() == 2:
         num_experts = router_probs.size(-1)
-
     else:
         raise ValueError(
             f"router_probs 维度不对，期望 [B, E] 或 [B, T, E]，实际是 {router_probs.shape}"
@@ -463,14 +536,13 @@ def compute_router_balance_loss(router_probs):
 
     mean_probs = router_probs.mean(dim=0)
     target_probs = torch.ones_like(mean_probs) / num_experts
-
     balance_loss = torch.sum((mean_probs - target_probs) ** 2)
 
     return balance_loss
 
 
 # ------------------------------------------------------------
-# 12. 统计 expert_loss
+# 13. 统计 expert_loss
 # ------------------------------------------------------------
 def update_expert_loss_stats(
     expert_loss_sums,
@@ -488,9 +560,7 @@ def update_expert_loss_stats(
         一个样本会贡献给 top-k expert。
         这里用 topk_gates 作为权重。
     """
-
     num_experts = expert_loss_sums.numel()
-
     loss_cpu = per_sample_loss.detach().cpu().float()
 
     if "topk_indices" in info:
@@ -542,7 +612,7 @@ def update_expert_loss_stats(
 
 
 # ------------------------------------------------------------
-# 13. 本地训练
+# 14. 本地训练
 # ------------------------------------------------------------
 def local_train(global_state_dict, train_loader, cfg, device):
     """
@@ -555,12 +625,10 @@ def local_train(global_state_dict, train_loader, cfg, device):
         expert_freq
         expert_loss
     """
-
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
 
     num_experts = model_cfg["num_experts"]
-
     router_balance_weight = train_cfg.get("router_balance_weight", 0.0)
 
     model = build_model(cfg)
@@ -648,7 +716,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
             optimizer.step()
 
             batch_size = images.size(0)
-
             total_loss += per_sample_ce_loss.detach().sum().item()
             total_samples += batch_size
 
@@ -691,14 +758,13 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
 
 # ------------------------------------------------------------
-# 14. 测试全局模型
+# 15. 测试全局模型
 # ------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, test_loader, device):
     """
     在测试集上评估全局模型。
     """
-
     model.to(device)
     model.eval()
 
@@ -714,7 +780,6 @@ def evaluate(model, test_loader, device):
 
         logits = model(images)
         loss = criterion(logits, labels)
-
         preds = torch.argmax(logits, dim=1)
 
         batch_size = images.size(0)
@@ -729,13 +794,12 @@ def evaluate(model, test_loader, device):
 
 
 # ------------------------------------------------------------
-# 15. 普通聚合权重
+# 16. 普通聚合权重
 # ------------------------------------------------------------
 def get_aggregation_weights(method, client_num_samples):
     """
     计算 uniform 或 sample_weighted 聚合权重。
     """
-
     num_clients = len(client_num_samples)
 
     if method == "uniform":
@@ -752,7 +816,7 @@ def get_aggregation_weights(method, client_num_samples):
 
 
 # ------------------------------------------------------------
-# 16. 普通聚合客户端参数
+# 17. 普通聚合客户端参数
 # ------------------------------------------------------------
 def aggregate_state_dicts(
     client_state_dicts,
@@ -762,7 +826,6 @@ def aggregate_state_dicts(
     """
     普通聚合函数。
     """
-
     agg_cfg = cfg["aggregation"]
 
     non_expert_method = agg_cfg["non_expert_agg"]
@@ -805,13 +868,12 @@ def aggregate_state_dicts(
 
 
 # ------------------------------------------------------------
-# 17. 打印客户端划分信息
+# 18. 打印客户端划分信息
 # ------------------------------------------------------------
 def print_partition_summary(client_indices):
     """
     打印每个客户端有多少样本。
     """
-
     print("========== 客户端数据划分 ==========")
 
     for client_id, indices in enumerate(client_indices):
@@ -821,13 +883,12 @@ def print_partition_summary(client_indices):
 
 
 # ------------------------------------------------------------
-# 18. 主训练流程
+# 19. 打印元网络输出 alpha
 # ------------------------------------------------------------
 def print_meta_alpha(alpha):
     """
     打印元网络输出的专家聚合权重。
     """
-
     if alpha is None:
         return
 
@@ -846,8 +907,9 @@ def print_meta_alpha(alpha):
     print("=======================================")
 
 
-
-
+# ------------------------------------------------------------
+# 20. 主训练流程
+# ------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
 
@@ -862,21 +924,23 @@ def main():
 
     cfg = load_config(args.config)
 
-    log_path = setup_logging(cfg)
+    log_path = setup_logging(
+        cfg=cfg,
+        config_path=args.config,
+    )
 
     print(f"配置文件路径: {args.config}")
 
     seed = cfg.get("seed", 1)
     set_seed(seed)
+
     print(f"随机种子: {seed}")
 
     device = get_device(cfg)
+
     print(f"使用设备: {device}")
 
-    train_set, test_set = run_without_file_logging(
-        build_datasets,
-        cfg,
-    )
+    train_set, test_set = build_datasets(cfg)
 
     server_val_set, final_test_set = split_server_validation_from_test_set(
         test_set=test_set,
@@ -969,6 +1033,7 @@ def main():
         )
 
         print("已启用 expert_agg = meta_network")
+
     else:
         print(f"使用普通 expert_agg = {expert_agg}")
 
@@ -988,6 +1053,7 @@ def main():
 
     if expert_agg == "meta_network":
         meta_cfg = cfg.get("meta", {})
+
         print("---------- Meta 配置 ----------")
         print(f"meta.hidden_dim     : {meta_cfg.get('hidden_dim', 32)}")
         print(f"meta.lr             : {meta_cfg.get('lr', 1e-3)}")
@@ -997,7 +1063,7 @@ def main():
         print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
         print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
         print(
-            "min_active_clients : "
+            "min_active_clients  : "
             f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
         )
 
@@ -1013,6 +1079,7 @@ def main():
             for name, tensor in global_model.state_dict().items()
         }
 
+        # 当前版本保持固定顺序：选前 clients_per_round 个客户端。
         selected_clients = list(range(clients_per_round))
 
         client_state_dicts = []
@@ -1071,7 +1138,6 @@ def main():
         )
 
         best_acc = max(best_acc, test_acc)
-
         avg_client_loss = float(np.mean(client_losses))
 
         if meta_info is not None:
@@ -1102,7 +1168,7 @@ def main():
 
 
 # ------------------------------------------------------------
-# 19. 程序入口
+# 21. 程序入口
 # ------------------------------------------------------------
 if __name__ == "__main__":
     main()
