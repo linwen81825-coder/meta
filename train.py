@@ -3,15 +3,11 @@
 # 最小版 FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
 #
 # 路径规则：
-# 1. CIFAR10 数据集固定放在当前项目目录 ./data
-# 2. torchvision 的 download=True 会自动判断：
-#    - 如果 ./data 里已有 CIFAR10，就直接加载
-#    - 如果没有，就自动下载
-# 3. config.yaml 里的 dataset.data_root 只作为日志目录
-# 4. 日志文件名自动取 data_root 的最后一级目录名
-#    例如：
-#       data_root: ./runs/b5f661
-#       log_path : ./runs/b5f661/b5f661.log
+#   1. CIFAR10 数据集固定放在当前项目目录 ./data
+#   2. torchvision 的 download=True 会自动判断：
+#      - 如果 ./data 里已有 CIFAR10，就直接加载
+#      - 如果没有，就自动下载
+#   3. config.yaml 里的 dataset.data_root 只作为日志目录
 # ------------------------------------------------------------
 
 import argparse
@@ -28,11 +24,17 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-from model import ResNet18SwitchMoE, is_expert_param, print_trainable_param_stats
+from model import (
+    ResNet18SwitchMoE,
+    is_expert_param,
+    print_trainable_param_stats,
+)
+
 from meta_aggregator import (
     MetaExpertAggregator,
     update_expert_counts,
     counts_to_frequency,
+    get_expert_id_from_name,
 )
 
 
@@ -87,7 +89,9 @@ def get_log_root(cfg):
     dataset_cfg = cfg.get("dataset", {})
     log_root = dataset_cfg.get("data_root", "./runs/default")
     log_root = make_abs_path(log_root)
+
     os.makedirs(log_root, exist_ok=True)
+
     return log_root
 
 
@@ -97,7 +101,6 @@ def get_log_name_from_root(log_root):
 
     例如：
         log_root = ./runs/b5f661
-    则：
         log_name = b5f661.log
     """
     norm_root = os.path.normpath(log_root)
@@ -118,11 +121,11 @@ def get_log_path(cfg):
 
     例如：
         dataset.data_root: ./runs/b5f661
-    则日志文件是：
-        ./runs/b5f661/b5f661.log
+        日志文件: ./runs/b5f661/b5f661.log
     """
     log_root = get_log_root(cfg)
     log_name = get_log_name_from_root(log_root)
+
     return os.path.join(log_root, log_name)
 
 
@@ -138,7 +141,9 @@ def copy_config_to_log_root(config_path, cfg):
 
     log_root = get_log_root(cfg)
     dst_path = os.path.join(log_root, "config_used.yaml")
+
     shutil.copy2(config_path, dst_path)
+
     return dst_path
 
 
@@ -185,7 +190,6 @@ def setup_logging(cfg, config_path=None):
 
     copy_config_to_log_root(config_path, cfg)
 
-    # 为了日志里显示成 ./data/xxx/logs/train.log 这种相对路径
     display_log_path = os.path.relpath(
         log_path,
         get_project_root(),
@@ -211,6 +215,7 @@ def load_config(config_path):
     """
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
     return cfg
 
 
@@ -270,15 +275,10 @@ def build_datasets(cfg):
     加载 CIFAR10 训练集和测试集。
 
     数据集固定在项目目录 ./data。
-
-    download=True 不等于每次都下载。
-    torchvision 会自动判断数据是否已经存在：
-        已存在：直接加载
-        不存在：自动下载
     """
     dataset_cfg = cfg["dataset"]
-
     dataset_name = dataset_cfg.get("name", "cifar10").lower()
+
     if dataset_name != "cifar10":
         raise ValueError(f"当前代码只支持 cifar10，收到 dataset.name={dataset_name}")
 
@@ -325,9 +325,9 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
     从 CIFAR10 测试集中划出服务器验证集。
 
     当前数据流：
-    train_set 全部用于客户端训练；
-    test_set 先划出 server validation set；
-    剩下的 test_set 用于最终测试。
+        train_set 全部用于客户端训练；
+        test_set 先划出 server validation set；
+        剩下的 test_set 用于最终测试。
     """
     server_cfg = cfg.get("server", {})
     dataset_cfg = cfg["dataset"]
@@ -382,9 +382,9 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
 
     print("========== Server 验证集划分 ==========")
     print("划分来源: CIFAR10 test set")
-    print(f"server val samples : {len(server_val_set)}")
-    print(f"final test samples : {len(final_test_set)}")
-    print(f"server val per class : {samples_per_class}")
+    print(f"server val samples       : {len(server_val_set)}")
+    print(f"final test samples       : {len(final_test_set)}")
+    print(f"server val per class     : {samples_per_class}")
     print("======================================")
 
     return server_val_set, final_test_set
@@ -398,6 +398,7 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
     用 Dirichlet 分布划分 non-IID 客户端数据。
     """
     rng = np.random.default_rng(seed)
+
     labels = np.array(labels)
     num_classes = int(labels.max()) + 1
 
@@ -527,8 +528,10 @@ def compute_router_balance_loss(router_probs):
     if router_probs.dim() == 3:
         num_experts = router_probs.size(-1)
         router_probs = router_probs.reshape(-1, num_experts)
+
     elif router_probs.dim() == 2:
         num_experts = router_probs.size(-1)
+
     else:
         raise ValueError(
             f"router_probs 维度不对，期望 [B, E] 或 [B, T, E]，实际是 {router_probs.shape}"
@@ -536,6 +539,7 @@ def compute_router_balance_loss(router_probs):
 
     mean_probs = router_probs.mean(dim=0)
     target_probs = torch.ones_like(mean_probs) / num_experts
+
     balance_loss = torch.sum((mean_probs - target_probs) ** 2)
 
     return balance_loss
@@ -561,6 +565,7 @@ def update_expert_loss_stats(
         这里用 topk_gates 作为权重。
     """
     num_experts = expert_loss_sums.numel()
+
     loss_cpu = per_sample_loss.detach().cpu().float()
 
     if "topk_indices" in info:
@@ -623,6 +628,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
         num_samples
         avg_loss
         expert_freq
+        expert_count_values
         expert_loss
     """
     train_cfg = cfg["train"]
@@ -716,6 +722,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
             optimizer.step()
 
             batch_size = images.size(0)
+
             total_loss += per_sample_ce_loss.detach().sum().item()
             total_samples += batch_size
 
@@ -723,6 +730,10 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
     expert_freq = counts_to_frequency(expert_counts)
     expert_freq = expert_freq.numpy().tolist()
+
+    # 原始 expert 激活次数。
+    # shape = [num_experts]
+    expert_count_values = expert_counts.numpy().tolist()
 
     expert_loss_values = []
 
@@ -753,6 +764,7 @@ def local_train(global_state_dict, train_loader, cfg, device):
         num_samples,
         avg_loss,
         expert_freq,
+        expert_count_values,
         expert_loss_values,
     )
 
@@ -780,9 +792,11 @@ def evaluate(model, test_loader, device):
 
         logits = model(images)
         loss = criterion(logits, labels)
+
         preds = torch.argmax(logits, dim=1)
 
         batch_size = images.size(0)
+
         total_loss += loss.item() * batch_size
         correct += (preds == labels).sum().item()
         total += batch_size
@@ -815,6 +829,73 @@ def get_aggregation_weights(method, client_num_samples):
     return weights
 
 
+def get_expert_activation_count_weights(
+    client_expert_counts,
+    expert_id,
+    num_clients,
+):
+    """
+    按 expert 激活次数计算某一个 expert 的客户端聚合权重。
+
+    输入：
+        client_expert_counts:
+            shape = [num_clients, num_experts]
+
+        expert_id:
+            当前要聚合的 expert 编号。
+
+    权重：
+        weight_i,e = count_i,e / sum_j count_j,e
+
+    如果所有客户端该 expert 的激活次数都为 0，
+    就退回 uniform。
+    """
+    if client_expert_counts is None:
+        raise ValueError(
+            "expert_agg=expert_activation_count_weighted 时，"
+            "必须传入 client_expert_counts。"
+        )
+
+    count_values = np.array(
+        client_expert_counts,
+        dtype=np.float64,
+    )
+
+    if count_values.ndim != 2:
+        raise ValueError(
+            "client_expert_counts 应该是二维，"
+            f"shape=[num_clients, num_experts]，实际是 {count_values.shape}"
+        )
+
+    input_num_clients, num_experts = count_values.shape
+
+    if input_num_clients != num_clients:
+        raise ValueError(
+            f"client_expert_counts 的客户端数量不一致: "
+            f"count_clients={input_num_clients}, num_clients={num_clients}"
+        )
+
+    if expert_id < 0 or expert_id >= num_experts:
+        raise ValueError(
+            f"expert_id 越界: expert_id={expert_id}, num_experts={num_experts}"
+        )
+
+    weights = count_values[:, expert_id].copy()
+    weights = np.maximum(weights, 0.0)
+
+    weight_sum = weights.sum()
+
+    if weight_sum <= 1e-12:
+        weights = np.ones(
+            num_clients,
+            dtype=np.float64,
+        ) / num_clients
+    else:
+        weights = weights / weight_sum
+
+    return weights
+
+
 # ------------------------------------------------------------
 # 17. 普通聚合客户端参数
 # ------------------------------------------------------------
@@ -822,9 +903,22 @@ def aggregate_state_dicts(
     client_state_dicts,
     client_num_samples,
     cfg,
+    client_expert_counts=None,
 ):
     """
     普通聚合函数。
+
+    non-expert 参数：
+        使用 non_expert_agg，例如 uniform / sample_weighted。
+
+    expert 参数：
+        支持：
+            uniform
+            sample_weighted
+            expert_activation_count_weighted
+
+    expert_activation_count_weighted：
+        对每个 expert 单独按激活次数加权。
     """
     agg_cfg = cfg["aggregation"]
 
@@ -832,32 +926,88 @@ def aggregate_state_dicts(
     expert_method = agg_cfg["expert_agg"]
 
     if expert_method == "meta_network":
-        raise ValueError("expert_agg=meta_network 时不应该调用普通 aggregate_state_dicts")
+        raise ValueError(
+            "expert_agg=meta_network 时不应该调用普通 aggregate_state_dicts"
+        )
+
+    activation_count_methods = {
+        "expert_activation_count_weighted",
+        "activation_count_weighted",
+    }
+
+    num_clients = len(client_num_samples)
 
     non_expert_weights = get_aggregation_weights(
         non_expert_method,
         client_num_samples,
     )
 
-    expert_weights = get_aggregation_weights(
-        expert_method,
-        client_num_samples,
-    )
+    if expert_method in activation_count_methods:
+        if client_expert_counts is None:
+            raise ValueError(
+                f"expert_agg={expert_method} 时，"
+                "aggregate_state_dicts 必须传入 client_expert_counts。"
+            )
+
+        count_values = np.array(
+            client_expert_counts,
+            dtype=np.float64,
+        )
+
+        if count_values.ndim != 2:
+            raise ValueError(
+                "client_expert_counts 应该是二维，"
+                f"shape=[num_clients, num_experts]，实际是 {count_values.shape}"
+            )
+
+        if count_values.shape[0] != num_clients:
+            raise ValueError(
+                f"client_expert_counts 客户端数量不一致: "
+                f"count_clients={count_values.shape[0]}, "
+                f"num_clients={num_clients}"
+            )
+
+        expert_weights = None
+
+    else:
+        expert_weights = get_aggregation_weights(
+            expert_method,
+            client_num_samples,
+        )
 
     new_state_dict = {}
+
     state_keys = client_state_dicts[0].keys()
 
     for name in state_keys:
-        if not torch.is_floating_point(client_state_dicts[0][name]):
-            new_state_dict[name] = client_state_dicts[0][name].clone()
+        first_tensor = client_state_dicts[0][name]
+
+        if not torch.is_floating_point(first_tensor):
+            new_state_dict[name] = first_tensor.clone()
             continue
 
         if is_expert_param(name):
-            weights = expert_weights
+            if expert_method in activation_count_methods:
+                expert_id = get_expert_id_from_name(name)
+
+                if expert_id is None:
+                    raise ValueError(
+                        f"参数名包含 expert，但解析不出 expert_id: {name}"
+                    )
+
+                weights = get_expert_activation_count_weights(
+                    client_expert_counts=client_expert_counts,
+                    expert_id=expert_id,
+                    num_clients=num_clients,
+                )
+
+            else:
+                weights = expert_weights
+
         else:
             weights = non_expert_weights
 
-        aggregated_tensor = torch.zeros_like(client_state_dicts[0][name])
+        aggregated_tensor = torch.zeros_like(first_tensor)
 
         for client_id, client_state in enumerate(client_state_dicts):
             aggregated_tensor += client_state[name] * float(weights[client_id])
@@ -1038,18 +1188,18 @@ def main():
         print(f"使用普通 expert_agg = {expert_agg}")
 
     print("========== 训练配置 ==========")
-    print(f"rounds            : {rounds}")
-    print(f"num_clients       : {num_clients}")
-    print(f"clients_per_round : {clients_per_round}")
-    print(f"local_epochs      : {train_cfg['local_epochs']}")
-    print(f"batch_size        : {train_cfg['batch_size']}")
-    print(f"lr                : {train_cfg['lr']}")
-    print(f"momentum          : {train_cfg.get('momentum', 0.9)}")
-    print(f"weight_decay      : {train_cfg.get('weight_decay', 0.0005)}")
-    print(f"router_balance_w  : {train_cfg.get('router_balance_weight', 0.0)}")
-    print(f"model.top_k       : {model_cfg.get('top_k', 1)}")
-    print(f"non_expert_agg    : {non_expert_agg}")
-    print(f"expert_agg        : {expert_agg}")
+    print(f"rounds              : {rounds}")
+    print(f"num_clients         : {num_clients}")
+    print(f"clients_per_round   : {clients_per_round}")
+    print(f"local_epochs        : {train_cfg['local_epochs']}")
+    print(f"batch_size          : {train_cfg['batch_size']}")
+    print(f"lr                  : {train_cfg['lr']}")
+    print(f"momentum            : {train_cfg.get('momentum', 0.9)}")
+    print(f"weight_decay        : {train_cfg.get('weight_decay', 0.0005)}")
+    print(f"router_balance_w    : {train_cfg.get('router_balance_weight', 0.0)}")
+    print(f"model.top_k         : {model_cfg.get('top_k', 1)}")
+    print(f"non_expert_agg      : {non_expert_agg}")
+    print(f"expert_agg          : {expert_agg}")
 
     if expert_agg == "meta_network":
         meta_cfg = cfg.get("meta", {})
@@ -1063,7 +1213,7 @@ def main():
         print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
         print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
         print(
-            "min_active_clients  : "
+            "min_active_clients : "
             f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
         )
 
@@ -1086,6 +1236,7 @@ def main():
         client_num_samples = []
         client_losses = []
         client_expert_freqs = []
+        client_expert_counts = []
         client_expert_losses = []
 
         for client_id in selected_clients:
@@ -1094,6 +1245,7 @@ def main():
                 num_samples,
                 avg_loss,
                 expert_freq,
+                expert_count_values,
                 expert_loss,
             ) = local_train(
                 global_state_dict=global_state_dict,
@@ -1106,6 +1258,7 @@ def main():
             client_num_samples.append(num_samples)
             client_losses.append(avg_loss)
             client_expert_freqs.append(expert_freq)
+            client_expert_counts.append(expert_count_values)
             client_expert_losses.append(expert_loss)
 
         meta_info = None
@@ -1117,6 +1270,7 @@ def main():
                 client_num_samples=client_num_samples,
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
+                client_expert_counts=client_expert_counts,
                 client_expert_losses=client_expert_losses,
                 val_loader=server_val_loader,
                 non_expert_agg=non_expert_agg,
@@ -1127,6 +1281,7 @@ def main():
                 client_state_dicts=client_state_dicts,
                 client_num_samples=client_num_samples,
                 cfg=cfg,
+                client_expert_counts=client_expert_counts,
             )
 
         global_model.load_state_dict(new_global_state_dict)
@@ -1138,6 +1293,7 @@ def main():
         )
 
         best_acc = max(best_acc, test_acc)
+
         avg_client_loss = float(np.mean(client_losses))
 
         if meta_info is not None:

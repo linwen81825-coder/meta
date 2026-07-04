@@ -11,25 +11,37 @@
 #   min_active_clients_per_expert: 2
 #   input_features:
 #     - expert_freq
+#     - expert_count_ratio
 #     - delta_norm_z
 #     - expert_loss_z
 #
-# 当前支持五个输入特征：
+# 支持输入特征：
 #
-# loss_z:
-#   标准化客户端训练 loss。
+#   loss_z:
+#       标准化客户端训练 loss。
 #
-# sample_ratio:
-#   当前客户端样本数占比。
+#   loss_raw:
+#       原始客户端训练 loss，不做 z-score。
 #
-# expert_freq:
-#   当前客户端上当前 expert 的激活频率。
+#   sample_ratio:
+#       当前客户端样本数占比。
 #
-# expert_loss_z:
-#   当前客户端当前 expert 对应样本平均 CE loss 的标准化值。
+#   expert_freq:
+#       当前客户端内部，当前 expert 的激活频率：
+#           count[i, e] / sum_e count[i, e]
 #
-# delta_norm_z:
-#   当前客户端当前 expert 参数更新幅度的标准化值。
+#   expert_count_ratio:
+#       同一个 expert 下，不同客户端之间的激活次数占比：
+#           count[i, e] / sum_j count[j, e]
+#
+#   expert_loss_z:
+#       当前客户端当前 expert 对应样本平均 CE loss 的标准化值。
+#
+#   expert_loss_raw:
+#       当前客户端当前 expert 对应样本平均 CE loss 原始值。
+#
+#   delta_norm_z:
+#       当前客户端当前 expert 参数更新幅度的标准化值。
 #
 # tau:
 #   softmax 温度系数。
@@ -37,24 +49,11 @@
 #
 # active_mask:
 #   是否只让激活过 expert 的客户端参与该 expert 的 softmax。
-#
-# min_active_clients_per_expert:
-#   最小活跃客户端数。
-#   如果某个 expert 的活跃客户端数量小于该值，
-#   则该 expert 退回所有客户端参与 softmax，避免单客户端主导。
-#
-# 本版修改：
-#   1. 元网络本体从普通 MLP 改成 DeepSets 风格。
-#   2. 对每个 expert，把该 expert 下所有 client 的特征作为一个集合输入。
-#   3. 不在元网络内部加入 LayerNorm / BatchNorm / RMSNorm。
-#   4. 原有输入特征里的 z-score 逻辑保持不变。
-#   5. meta 更新方式保持旧逻辑：
-#      多个 validation batch 平均成一个 meta loss，
-#      每个 meta step 只更新一次元网络。
 # ------------------------------------------------------------
 
 import os
 import re
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -79,8 +78,10 @@ def get_expert_id_from_name(name):
     如果这个参数不是 expert 参数，就返回 None。
     """
     match = re.search(r"experts\.(\d+)", name)
+
     if match is None:
         return None
+
     return int(match.group(1))
 
 
@@ -94,6 +95,7 @@ def get_basic_weights(method, client_num_samples):
     当前支持：
         uniform:
             每个客户端权重相同。
+
         sample_weighted:
             按客户端样本数加权。
     """
@@ -101,9 +103,11 @@ def get_basic_weights(method, client_num_samples):
 
     if method == "uniform":
         weights = np.ones(num_clients, dtype=np.float64) / num_clients
+
     elif method == "sample_weighted":
         client_num_samples = np.array(client_num_samples, dtype=np.float64)
         weights = client_num_samples / client_num_samples.sum()
+
     else:
         raise ValueError(f"未知普通聚合方式: {method}")
 
@@ -118,30 +122,38 @@ def update_expert_counts(expert_counts, expert_indices):
     根据 expert id 更新 expert 激活次数。
 
     支持两种输入：
+
         top1:
             expert_indices shape = [B]
+
         topk:
             expert_indices shape = [B, K]
 
     top2 时，一个样本会贡献两个 expert 激活。
     """
     num_experts = expert_counts.numel()
+
     expert_indices = expert_indices.detach().cpu().reshape(-1)
 
     batch_counts = torch.bincount(
         expert_indices,
         minlength=num_experts,
     )
+
     expert_counts += batch_counts
 
 
 def counts_to_frequency(expert_counts):
     """
-    把 expert 激活次数转换成 expert 激活频率。
+    把 expert 激活次数转换成客户端内部 expert 激活频率。
+
+    expert_freq[e] = count[e] / sum_e count[e]
     """
     total = expert_counts.sum().item()
+
     if total <= 0:
         return torch.zeros_like(expert_counts, dtype=torch.float32)
+
     return expert_counts.float() / total
 
 
@@ -159,13 +171,6 @@ class MetaWeightNet(nn.Module):
         1. 对同一个 expert e 下所有 client 的特征 x_{e,i} 编码，得到 h_{e,i}
         2. 对 client 维度做 mean pooling，得到 context_e
         3. 用 [h_{e,i}, context_e, h_{e,i} - context_e] 输出 score_{e,i}
-
-    这样元网络不是孤立地给某个 client-expert pair 打分，
-    而是能利用“同一个 expert 下所有 client 的集合上下文”进行相对比较。
-
-    注意：
-        按当前实验要求，本类不使用 LayerNorm / BatchNorm / RMSNorm。
-        如果输入特征需要标准化，仍然在 build_meta_features() 里完成。
     """
 
     def __init__(self, input_dim, hidden_dim=32):
@@ -173,14 +178,13 @@ class MetaWeightNet(nn.Module):
 
         if input_dim <= 0:
             raise ValueError("MetaWeightNet 的 input_dim 必须大于 0")
+
         if hidden_dim <= 0:
             raise ValueError("MetaWeightNet 的 hidden_dim 必须大于 0")
 
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
 
-        # 对每个 client-expert 特征做共享编码。
-        # 这里不加 LayerNorm / BatchNorm / RMSNorm。
         self.encoder = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
             nn.ReLU(inplace=True),
@@ -188,7 +192,6 @@ class MetaWeightNet(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 结合局部表示、expert 内集合上下文、以及二者差值后输出 score。
         self.score_head = nn.Sequential(
             nn.Linear(self.hidden_dim * 3, self.hidden_dim),
             nn.ReLU(inplace=True),
@@ -201,7 +204,8 @@ class MetaWeightNet(nn.Module):
             shape: [num_experts, num_clients, input_dim]
 
         return:
-            scores: shape: [num_experts, num_clients]
+            scores:
+                shape: [num_experts, num_clients]
         """
         if x.dim() != 3:
             raise ValueError(
@@ -211,6 +215,7 @@ class MetaWeightNet(nn.Module):
             )
 
         num_experts, num_clients, input_dim = x.shape
+
         if input_dim != self.input_dim:
             raise ValueError(
                 f"MetaWeightNet 输入维度不一致: "
@@ -219,23 +224,40 @@ class MetaWeightNet(nn.Module):
 
         flat_x = x.reshape(num_experts * num_clients, input_dim)
         flat_h = self.encoder(flat_x)
-        h = flat_h.reshape(num_experts, num_clients, self.hidden_dim)
 
-        # DeepSets 的 permutation-invariant 集合上下文。
-        # 对每个 expert，在 client 维度求平均。
-        context = h.mean(dim=1, keepdim=True)
-        context = context.expand(-1, num_clients, -1)
+        h = flat_h.reshape(
+            num_experts,
+            num_clients,
+            self.hidden_dim,
+        )
+
+        context = h.mean(
+            dim=1,
+            keepdim=True,
+        )
+
+        context = context.expand(
+            -1,
+            num_clients,
+            -1,
+        )
 
         score_input = torch.cat(
             [h, context, h - context],
             dim=-1,
         )
+
         flat_score_input = score_input.reshape(
             num_experts * num_clients,
             self.hidden_dim * 3,
         )
+
         flat_scores = self.score_head(flat_score_input).squeeze(-1)
-        scores = flat_scores.reshape(num_experts, num_clients)
+
+        scores = flat_scores.reshape(
+            num_experts,
+            num_clients,
+        )
 
         return scores
 
@@ -278,6 +300,7 @@ class MetaExpertAggregator:
 
         if tau <= 0:
             raise ValueError(f"meta.tau 必须大于 0，当前 tau={tau}")
+
         self.tau = float(tau)
 
         self.active_mask = bool(active_mask)
@@ -288,6 +311,7 @@ class MetaExpertAggregator:
                 "min_active_clients_per_expert 必须 >= 1，"
                 f"当前值为 {min_active_clients_per_expert}"
             )
+
         self.min_active_clients_per_expert = int(min_active_clients_per_expert)
 
         if input_features is None:
@@ -301,6 +325,7 @@ class MetaExpertAggregator:
             "loss_z",
             "sample_ratio",
             "expert_freq",
+            "expert_count_ratio",
             "expert_loss_z",
             "delta_norm_z",
             "loss_raw",
@@ -314,6 +339,7 @@ class MetaExpertAggregator:
             )
 
         input_features = list(input_features)
+
         if len(input_features) == 0:
             raise ValueError("meta.input_features 不能为空")
 
@@ -321,6 +347,7 @@ class MetaExpertAggregator:
             name for name in input_features
             if name not in allowed_features
         ]
+
         if len(unknown_features) > 0:
             raise ValueError(
                 f"未知 meta input feature: {unknown_features}. "
@@ -345,6 +372,7 @@ class MetaExpertAggregator:
             raise ValueError(
                 "MetaExpertAggregator 必须传入 train_log_path，不能使用写死日志路径。"
             )
+
         self.train_log_path = train_log_path
 
     # --------------------------------------------------------
@@ -355,12 +383,14 @@ class MetaExpertAggregator:
         根据 client_num_samples 得到本轮参与聚合的客户端数量。
         """
         num_clients = len(client_num_samples)
+
         if num_clients <= 0:
             raise ValueError("本轮客户端数量为空")
+
         return num_clients
 
     # --------------------------------------------------------
-    # 5.2 特征：loss_z
+    # 5.2 特征：loss_z / loss_raw
     # --------------------------------------------------------
     def build_loss_z_feature(
         self,
@@ -396,7 +426,9 @@ class MetaExpertAggregator:
             self.num_experts,
             num_clients,
         )
+
         return loss_z_feature
+
     def build_loss_raw_feature(
         self,
         client_losses,
@@ -430,7 +462,9 @@ class MetaExpertAggregator:
             self.num_experts,
             num_clients,
         )
+
         return loss_raw_feature
+
     # --------------------------------------------------------
     # 5.3 特征：sample_ratio
     # --------------------------------------------------------
@@ -461,10 +495,12 @@ class MetaExpertAggregator:
             )
 
         sample_ratio = sample_counts / sample_counts.sum().clamp_min(1e-6)
+
         sample_ratio_feature = sample_ratio.unsqueeze(0).expand(
             self.num_experts,
             num_clients,
         )
+
         return sample_ratio_feature
 
     # --------------------------------------------------------
@@ -483,6 +519,9 @@ class MetaExpertAggregator:
 
         输出：
             expert_freq_feature: [E, C]
+
+        含义：
+            expert_freq[i, e] = count[i, e] / sum_e count[i, e]
         """
         expert_freqs = torch.as_tensor(
             client_expert_freqs,
@@ -510,10 +549,95 @@ class MetaExpertAggregator:
             )
 
         expert_freq_feature = expert_freqs.transpose(0, 1)
+
         return expert_freq_feature
 
     # --------------------------------------------------------
-    # 5.5 特征：expert_loss_z
+    # 5.5 特征：expert_count_ratio
+    # --------------------------------------------------------
+    def build_expert_count_ratio_feature(
+        self,
+        client_expert_counts,
+        num_clients,
+    ):
+        """
+        构造 expert_count_ratio 特征。
+
+        输入：
+            client_expert_counts:
+                shape = [num_clients, num_experts]
+
+                client_expert_counts[i][e] 表示：
+                    client i 本地训练期间，expert e 被选中的原始次数。
+
+        输出：
+            expert_count_ratio:
+                shape = [num_experts, num_clients]
+
+        计算方式：
+            对每个 expert e，在所有 client 上归一化：
+
+                ratio[e, i] = count[i, e] / sum_j count[j, e]
+
+        注意：
+            这和 expert_freq 不一样。
+
+            expert_freq 是：
+                count[i, e] / sum_e count[i, e]
+
+            expert_count_ratio 是：
+                count[i, e] / sum_i count[i, e]
+        """
+        if client_expert_counts is None:
+            raise ValueError(
+                "使用 expert_count_ratio 时，必须从 train.py 传入 client_expert_counts。"
+            )
+
+        expert_counts = torch.as_tensor(
+            client_expert_counts,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if expert_counts.dim() != 2:
+            raise ValueError(
+                "client_expert_counts 应该是二维，shape=[num_clients, num_experts]"
+            )
+
+        input_num_clients, input_num_experts = expert_counts.shape
+
+        if input_num_clients != num_clients:
+            raise ValueError(
+                f"client_expert_counts 客户端数量不一致: "
+                f"count_clients={input_num_clients}, num_clients={num_clients}"
+            )
+
+        if input_num_experts != self.num_experts:
+            raise ValueError(
+                f"expert 数量不一致: 当前 aggregator num_experts={self.num_experts}, "
+                f"但是输入 expert_counts.shape={expert_counts.shape}"
+            )
+
+        # [C, E] -> [E, C]
+        expert_counts = expert_counts.transpose(0, 1)
+
+        denom = expert_counts.sum(
+            dim=1,
+            keepdim=True,
+        )
+
+        uniform = torch.ones_like(expert_counts) / num_clients
+
+        expert_count_ratio = torch.where(
+            denom > 1e-12,
+            expert_counts / denom.clamp_min(1e-12),
+            uniform,
+        )
+
+        return expert_count_ratio
+
+    # --------------------------------------------------------
+    # 5.6 特征：expert_loss_z / expert_loss_raw
     # --------------------------------------------------------
     def build_expert_loss_z_feature(
         self,
@@ -524,10 +648,12 @@ class MetaExpertAggregator:
         构造 expert_loss_z 特征。
 
         输入：
-            client_expert_losses: shape: [num_clients, num_experts]
+            client_expert_losses:
+                shape: [num_clients, num_experts]
 
         输出：
-            expert_loss_z: shape: [num_experts, num_clients]
+            expert_loss_z:
+                shape: [num_experts, num_clients]
         """
         if client_expert_losses is None:
             raise ValueError(
@@ -565,6 +691,7 @@ class MetaExpertAggregator:
             dim=1,
             keepdim=True,
         )
+
         loss_std = expert_loss.std(
             dim=1,
             unbiased=False,
@@ -572,8 +699,9 @@ class MetaExpertAggregator:
         ).clamp_min(1e-6)
 
         expert_loss_z = (expert_loss - loss_mean) / loss_std
+
         return expert_loss_z
-    
+
     def build_expert_loss_raw_feature(
         self,
         client_expert_losses,
@@ -583,10 +711,12 @@ class MetaExpertAggregator:
         构造 expert_loss_raw 特征。
 
         输入：
-            client_expert_losses: shape: [num_clients, num_experts]
+            client_expert_losses:
+                shape: [num_clients, num_experts]
 
         输出：
-            expert_loss_raw: shape: [num_experts, num_clients]
+            expert_loss_raw:
+                shape: [num_experts, num_clients]
 
         注意：
             这里不做 z-score 标准化，直接使用每个 client-expert 的平均 CE loss。
@@ -621,12 +751,12 @@ class MetaExpertAggregator:
                 f"但是输入 expert_losses.shape={expert_losses.shape}"
             )
 
-        # 原始输入 shape 是 [client, expert]
-        # 元网络需要 [expert, client]
         expert_loss_raw = expert_losses.transpose(0, 1)
+
         return expert_loss_raw
+
     # --------------------------------------------------------
-    # 5.6 计算 expert delta norm
+    # 5.7 计算 expert delta norm
     # --------------------------------------------------------
     def compute_expert_delta_norms(
         self,
@@ -638,7 +768,8 @@ class MetaExpertAggregator:
         计算每个 client-expert pair 的参数更新幅度。
 
         输出：
-            delta_norms: shape: [num_experts, num_clients]
+            delta_norms:
+                shape: [num_experts, num_clients]
         """
         if client_state_dicts is None:
             raise ValueError(
@@ -668,6 +799,7 @@ class MetaExpertAggregator:
                     continue
 
                 expert_id = get_expert_id_from_name(name)
+
                 if expert_id is None:
                     continue
 
@@ -683,15 +815,17 @@ class MetaExpertAggregator:
                 global_tensor = global_tensor.detach().cpu().float()
 
                 diff = client_tensor - global_tensor
+
                 delta_sq[expert_id, client_id] += float(
                     torch.sum(diff * diff).item()
                 )
 
         delta_norms = torch.sqrt(delta_sq).float().to(self.device)
+
         return delta_norms
 
     # --------------------------------------------------------
-    # 5.7 特征：delta_norm_z
+    # 5.8 特征：delta_norm_z
     # --------------------------------------------------------
     def build_delta_norm_z_feature(
         self,
@@ -715,6 +849,7 @@ class MetaExpertAggregator:
             dim=1,
             keepdim=True,
         )
+
         delta_std = delta_norm.std(
             dim=1,
             unbiased=False,
@@ -722,16 +857,18 @@ class MetaExpertAggregator:
         ).clamp_min(1e-6)
 
         delta_norm_z = (delta_norm - delta_mean) / delta_std
+
         return delta_norm_z
 
     # --------------------------------------------------------
-    # 5.8 按配置构造元网络输入特征
+    # 5.9 按配置构造元网络输入特征
     # --------------------------------------------------------
     def build_meta_features(
         self,
         client_losses,
         client_expert_freqs,
         client_num_samples,
+        client_expert_counts=None,
         client_expert_losses=None,
         client_state_dicts=None,
         global_state_dict=None,
@@ -739,15 +876,9 @@ class MetaExpertAggregator:
         """
         构造元网络输入特征。
 
-        当前支持：
-            loss_z
-            sample_ratio
-            expert_freq
-            expert_loss_z
-            delta_norm_z
-
         输出：
-            features: shape: [num_experts, num_clients, input_dim]
+            features:
+                shape: [num_experts, num_clients, input_dim]
         """
         num_clients = self.get_num_clients(
             client_num_samples=client_num_samples,
@@ -761,37 +892,50 @@ class MetaExpertAggregator:
                     client_losses=client_losses,
                     num_clients=num_clients,
                 )
+
             elif feature_name == "loss_raw":
                 feature = self.build_loss_raw_feature(
                     client_losses=client_losses,
                     num_clients=num_clients,
                 )
+
             elif feature_name == "sample_ratio":
                 feature = self.build_sample_ratio_feature(
                     client_num_samples=client_num_samples,
                     num_clients=num_clients,
                 )
+
             elif feature_name == "expert_freq":
                 feature = self.build_expert_freq_feature(
                     client_expert_freqs=client_expert_freqs,
                     num_clients=num_clients,
                 )
+
+            elif feature_name == "expert_count_ratio":
+                feature = self.build_expert_count_ratio_feature(
+                    client_expert_counts=client_expert_counts,
+                    num_clients=num_clients,
+                )
+
             elif feature_name == "expert_loss_z":
                 feature = self.build_expert_loss_z_feature(
                     client_expert_losses=client_expert_losses,
                     num_clients=num_clients,
                 )
+
             elif feature_name == "expert_loss_raw":
                 feature = self.build_expert_loss_raw_feature(
                     client_expert_losses=client_expert_losses,
                     num_clients=num_clients,
                 )
+
             elif feature_name == "delta_norm_z":
                 feature = self.build_delta_norm_z_feature(
                     client_state_dicts=client_state_dicts,
                     global_state_dict=global_state_dict,
                     num_clients=num_clients,
                 )
+
             else:
                 raise ValueError(f"未知 meta input feature: {feature_name}")
 
@@ -801,10 +945,11 @@ class MetaExpertAggregator:
             selected_features,
             dim=-1,
         )
+
         return features
 
     # --------------------------------------------------------
-    # 5.9 根据 expert_freq 构造 active mask
+    # 5.10 根据 expert_freq 构造 active mask
     # --------------------------------------------------------
     def build_active_mask(
         self,
@@ -815,22 +960,12 @@ class MetaExpertAggregator:
         构造 active mask。
 
         输入：
-            client_expert_freqs: shape = [num_clients, num_experts]
+            client_expert_freqs:
+                shape = [num_clients, num_experts]
 
         输出：
-            active_mask: shape = [num_experts, num_clients]
-
-        逻辑：
-            active_mask[e, i] = True:
-                client i 的 expert e 被激活过，参与该 expert 的 softmax。
-            active_mask[e, i] = False:
-                client i 的 expert e 未激活，不参与该 expert 的 softmax。
-
-        保护机制：
-            如果某个 expert 的 active client 数量小于
-            self.min_active_clients_per_expert，
-            则该 expert 退回所有客户端参与 softmax，
-            避免单个客户端完全主导该 expert。
+            active_mask:
+                shape = [num_experts, num_clients]
         """
         expert_freqs = torch.as_tensor(
             client_expert_freqs,
@@ -858,9 +993,11 @@ class MetaExpertAggregator:
             )
 
         expert_freq_feature = expert_freqs.transpose(0, 1)
+
         active_mask = expert_freq_feature > self.active_threshold
 
         active_count = active_mask.sum(dim=1, keepdim=True)
+
         too_few_active = active_count < self.min_active_clients_per_expert
 
         if too_few_active.any():
@@ -873,7 +1010,7 @@ class MetaExpertAggregator:
         return active_mask
 
     # --------------------------------------------------------
-    # 5.10 计算 alpha 诊断信息
+    # 5.11 计算 alpha 诊断信息
     # --------------------------------------------------------
     def compute_alpha_stats(self, scores, alpha):
         """
@@ -889,12 +1026,15 @@ class MetaExpertAggregator:
             score_abs_mean = scores_detached.abs().mean().item()
 
             eps = 1e-12
+
             entropy = -torch.sum(
                 alpha_detached * torch.log(alpha_detached.clamp_min(eps)),
                 dim=1,
             )
+
             if num_clients > 1:
                 entropy = entropy / np.log(num_clients)
+
             alpha_entropy = entropy.mean().item()
 
             alpha_std = alpha_detached.std(unbiased=False).item()
@@ -909,10 +1049,11 @@ class MetaExpertAggregator:
             "alpha_max_mean": alpha_max_mean,
             "alpha_min_mean": alpha_min_mean,
         }
+
         return stats
 
     # --------------------------------------------------------
-    # 5.11 计算元网络梯度范数
+    # 5.12 计算元网络梯度范数
     # --------------------------------------------------------
     def compute_meta_grad_norm(self):
         """
@@ -924,22 +1065,27 @@ class MetaExpertAggregator:
         for param in self.meta_net.parameters():
             if param.grad is None:
                 continue
+
             grad = param.grad.detach().float()
+
             total_sq += torch.sum(grad * grad).item()
+
             current_max = grad.abs().max().item()
             grad_max_abs = max(grad_max_abs, current_max)
 
         grad_norm = total_sq ** 0.5
+
         return grad_norm, grad_max_abs
 
     # --------------------------------------------------------
-    # 5.12 把元网络输入写入 train.log，不打印到控制台
+    # 5.13 把元网络输入写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_inputs(
         self,
         client_losses,
         client_expert_freqs,
         client_num_samples,
+        client_expert_counts=None,
         client_expert_losses=None,
         client_state_dicts=None,
         global_state_dict=None,
@@ -947,33 +1093,41 @@ class MetaExpertAggregator:
         """
         记录元网络输入特征到当前实验 train.log。
         """
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        log_dir = os.path.dirname(self.train_log_path)
+
+        if log_dir != "":
+            os.makedirs(
+                log_dir,
+                exist_ok=True,
+            )
 
         features = self.build_meta_features(
             client_losses=client_losses,
             client_expert_freqs=client_expert_freqs,
             client_num_samples=client_num_samples,
+            client_expert_counts=client_expert_counts,
             client_expert_losses=client_expert_losses,
             client_state_dicts=client_state_dicts,
             global_state_dict=global_state_dict,
         )
+
         features = features.detach().cpu()
 
         with open(self.train_log_path, "a", encoding="utf-8") as f:
             f.write(f"[META_INPUT_BEGIN] round={self.round_id}\n")
 
             num_experts, num_clients, input_dim = features.shape
+
             for expert_id in range(num_experts):
                 for client_id in range(num_clients):
                     feature_texts = []
+
                     for feature_idx, feature_name in enumerate(self.input_feature_names):
                         value = features[expert_id, client_id, feature_idx].item()
                         feature_texts.append(f"{feature_name}={value:.8f}")
 
                     feature_text = " ".join(feature_texts)
+
                     f.write(
                         f"[META_INPUT] "
                         f"round={self.round_id} "
@@ -985,7 +1139,7 @@ class MetaExpertAggregator:
             f.write(f"[META_INPUT_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.13 把最终聚合权重 alpha 写入 train.log，不打印到控制台
+    # 5.14 把最终聚合权重 alpha 写入 train.log，不打印到控制台
     # --------------------------------------------------------
     def log_meta_alpha(
         self,
@@ -995,12 +1149,16 @@ class MetaExpertAggregator:
         """
         记录元网络最终输出的 expert 聚合权重到当前实验 train.log。
         """
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        log_dir = os.path.dirname(self.train_log_path)
+
+        if log_dir != "":
+            os.makedirs(
+                log_dir,
+                exist_ok=True,
+            )
 
         alpha = alpha.detach().cpu()
+
         sample_weighted = get_basic_weights(
             method="sample_weighted",
             client_num_samples=client_num_samples,
@@ -1010,10 +1168,12 @@ class MetaExpertAggregator:
             f.write(f"[META_ALPHA_BEGIN] round={self.round_id}\n")
 
             num_experts, num_clients = alpha.shape
+
             for expert_id in range(num_experts):
                 for client_id in range(num_clients):
                     alpha_value = alpha[expert_id, client_id].item()
                     sample_weight = float(sample_weighted[client_id])
+
                     f.write(
                         f"[META_ALPHA] "
                         f"round={self.round_id} "
@@ -1026,7 +1186,7 @@ class MetaExpertAggregator:
             f.write(f"[META_ALPHA_END] round={self.round_id}\n")
 
     # --------------------------------------------------------
-    # 5.14 记录 meta 训练诊断信息
+    # 5.15 记录 meta 训练诊断信息
     # --------------------------------------------------------
     def log_meta_diagnostics(
         self,
@@ -1038,16 +1198,14 @@ class MetaExpertAggregator:
     ):
         """
         记录每个 meta step 的诊断信息。
-
-        注意：
-            这里是旧逻辑：
-            多个 validation batch 先平均成一个 meta loss，
-            每个 meta step 只 optimizer.step() 一次。
         """
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        log_dir = os.path.dirname(self.train_log_path)
+
+        if log_dir != "":
+            os.makedirs(
+                log_dir,
+                exist_ok=True,
+            )
 
         with open(self.train_log_path, "a", encoding="utf-8") as f:
             f.write(
@@ -1066,16 +1224,19 @@ class MetaExpertAggregator:
             )
 
     # --------------------------------------------------------
-    # 5.15 记录最终 alpha 的诊断信息
+    # 5.16 记录最终 alpha 的诊断信息
     # --------------------------------------------------------
     def log_meta_final_diagnostics(self, alpha_stats):
         """
         记录元网络更新完成后，最终 alpha 的诊断信息。
         """
-        os.makedirs(
-            os.path.dirname(self.train_log_path),
-            exist_ok=True,
-        )
+        log_dir = os.path.dirname(self.train_log_path)
+
+        if log_dir != "":
+            os.makedirs(
+                log_dir,
+                exist_ok=True,
+            )
 
         with open(self.train_log_path, "a", encoding="utf-8") as f:
             f.write(
@@ -1090,7 +1251,7 @@ class MetaExpertAggregator:
             )
 
     # --------------------------------------------------------
-    # 5.16 元网络输出 alpha：直接从已构造好的 features 计算
+    # 5.17 元网络输出 alpha：直接从已构造好的 features 计算
     # --------------------------------------------------------
     def compute_alpha_from_features(
         self,
@@ -1115,8 +1276,6 @@ class MetaExpertAggregator:
                 f"features_input_dim={input_dim}, expected={len(self.input_feature_names)}"
             )
 
-        # DeepSets 版元网络直接接收 [E, C, F]，
-        # 在同一个 expert 内对所有 client 做集合建模，返回 [E, C] scores。
         scores = self.meta_net(features)
 
         if self.active_mask:
@@ -1124,32 +1283,39 @@ class MetaExpertAggregator:
                 client_expert_freqs=client_expert_freqs,
                 num_clients=num_clients,
             )
+
             scores_for_softmax = scores.masked_fill(
                 ~active_mask,
                 -1e9,
             )
+
         else:
             scores_for_softmax = scores
 
-        alpha = F.softmax(scores_for_softmax / self.tau, dim=1)
+        alpha = F.softmax(
+            scores_for_softmax / self.tau,
+            dim=1,
+        )
 
         if return_stats:
             stats = self.compute_alpha_stats(
                 scores=scores,
                 alpha=alpha,
             )
+
             return alpha, stats
 
         return alpha
 
     # --------------------------------------------------------
-    # 5.17 元网络输出 alpha：从原始输入构造 features 后计算
+    # 5.18 元网络输出 alpha：从原始输入构造 features 后计算
     # --------------------------------------------------------
     def compute_alpha(
         self,
         client_losses,
         client_expert_freqs,
         client_num_samples,
+        client_expert_counts=None,
         client_expert_losses=None,
         client_state_dicts=None,
         global_state_dict=None,
@@ -1162,6 +1328,7 @@ class MetaExpertAggregator:
             client_losses=client_losses,
             client_expert_freqs=client_expert_freqs,
             client_num_samples=client_num_samples,
+            client_expert_counts=client_expert_counts,
             client_expert_losses=client_expert_losses,
             client_state_dicts=client_state_dicts,
             global_state_dict=global_state_dict,
@@ -1174,7 +1341,7 @@ class MetaExpertAggregator:
         )
 
     # --------------------------------------------------------
-    # 5.18 根据 alpha 构造聚合后的 state_dict
+    # 5.19 根据 alpha 构造聚合后的 state_dict
     # --------------------------------------------------------
     def build_aggregated_state_dict(
         self,
@@ -1215,6 +1382,7 @@ class MetaExpertAggregator:
 
             if is_expert_param(name):
                 expert_id = get_expert_id_from_name(name)
+
                 if expert_id is None:
                     raise ValueError(f"参数名包含 experts 但解析不出 expert id: {name}")
 
@@ -1227,9 +1395,11 @@ class MetaExpertAggregator:
                 for client_id, client_state in enumerate(client_state_dicts):
                     weight = alpha[expert_id, client_id]
                     tensor = client_state[name].to(device)
+
                     aggregated_tensor = aggregated_tensor + weight * tensor
 
                 new_state_dict[name] = aggregated_tensor
+
             else:
                 aggregated_tensor = torch.zeros_like(
                     first_tensor,
@@ -1240,6 +1410,7 @@ class MetaExpertAggregator:
                 for client_id, client_state in enumerate(client_state_dicts):
                     weight = float(non_expert_weights[client_id])
                     tensor = client_state[name].to(device)
+
                     aggregated_tensor = aggregated_tensor + weight * tensor
 
                 new_state_dict[name] = aggregated_tensor
@@ -1247,16 +1418,14 @@ class MetaExpertAggregator:
         return new_state_dict
 
     # --------------------------------------------------------
-    # 5.19 在 server validation set 上计算平均 CE loss
+    # 5.20 在 server validation set 上计算平均 CE loss
     # --------------------------------------------------------
     def compute_validation_loss(self, model, temp_state_dict, val_loader):
         """
         用临时聚合参数在 server validation set 上计算平均 CE loss。
-
-        这里会把最多 max_val_batches 个 validation batch 的 loss
-        按样本数加权平均成一个 meta loss。
         """
         model.eval()
+
         criterion = nn.CrossEntropyLoss()
 
         total_loss = 0.0
@@ -1274,9 +1443,11 @@ class MetaExpertAggregator:
                 temp_state_dict,
                 (images,),
             )
+
             loss = criterion(logits, labels)
 
             batch_size = images.size(0)
+
             total_loss = total_loss + loss * batch_size
             total_samples += batch_size
 
@@ -1284,10 +1455,11 @@ class MetaExpertAggregator:
             raise ValueError("server validation loader 为空，无法计算 meta loss")
 
         avg_loss = total_loss / total_samples
+
         return avg_loss
 
     # --------------------------------------------------------
-    # 5.20 主函数：更新元网络并返回最终聚合模型
+    # 5.21 主函数：更新元网络并返回最终聚合模型
     # --------------------------------------------------------
     def aggregate(
         self,
@@ -1296,6 +1468,7 @@ class MetaExpertAggregator:
         client_num_samples,
         client_losses,
         client_expert_freqs,
+        client_expert_counts,
         client_expert_losses,
         val_loader,
         non_expert_agg="sample_weighted",
@@ -1306,12 +1479,6 @@ class MetaExpertAggregator:
         旧逻辑：
             每个 meta step 内，先用 max_val_batches 个 validation batch
             计算一个平均 meta loss，然后只更新元网络一次。
-
-        如果配置是：
-            meta_steps = 1
-            max_val_batches = 4
-
-        那么每轮 FL 里元网络只更新 1 次，不是 4 次。
         """
         model.to(self.device)
 
@@ -1326,6 +1493,7 @@ class MetaExpertAggregator:
             client_losses=client_losses,
             client_expert_freqs=client_expert_freqs,
             client_num_samples=client_num_samples,
+            client_expert_counts=client_expert_counts,
             client_expert_losses=client_expert_losses,
             client_state_dicts=client_state_dicts,
             global_state_dict=global_state_dict,
@@ -1340,6 +1508,7 @@ class MetaExpertAggregator:
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
                 client_num_samples=client_num_samples,
+                client_expert_counts=client_expert_counts,
                 client_expert_losses=client_expert_losses,
                 client_state_dicts=client_state_dicts,
                 global_state_dict=global_state_dict,
@@ -1363,6 +1532,7 @@ class MetaExpertAggregator:
             meta_loss.backward()
 
             meta_grad_norm, meta_grad_max_abs = self.compute_meta_grad_norm()
+
             meta_loss_value = meta_loss.item()
 
             self.log_meta_diagnostics(
@@ -1380,28 +1550,29 @@ class MetaExpertAggregator:
                 client_losses=client_losses,
                 client_expert_freqs=client_expert_freqs,
                 client_num_samples=client_num_samples,
+                client_expert_counts=client_expert_counts,
                 client_expert_losses=client_expert_losses,
                 client_state_dicts=client_state_dicts,
                 global_state_dict=global_state_dict,
                 return_stats=True,
             )
 
-        self.log_meta_final_diagnostics(
-            alpha_stats=final_alpha_stats,
-        )
+            self.log_meta_final_diagnostics(
+                alpha_stats=final_alpha_stats,
+            )
 
-        self.log_meta_alpha(
-            alpha=final_alpha,
-            client_num_samples=client_num_samples,
-        )
+            self.log_meta_alpha(
+                alpha=final_alpha,
+                client_num_samples=client_num_samples,
+            )
 
-        final_state_dict = self.build_aggregated_state_dict(
-            client_state_dicts=client_state_dicts,
-            client_num_samples=client_num_samples,
-            non_expert_agg=non_expert_agg,
-            alpha=final_alpha,
-            device=torch.device("cpu"),
-        )
+            final_state_dict = self.build_aggregated_state_dict(
+                client_state_dicts=client_state_dicts,
+                client_num_samples=client_num_samples,
+                non_expert_agg=non_expert_agg,
+                alpha=final_alpha,
+                device=torch.device("cpu"),
+            )
 
         info = {
             "meta_loss": meta_loss_value,
