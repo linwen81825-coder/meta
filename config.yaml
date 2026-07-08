@@ -15,6 +15,12 @@ dataset:
     shuffle: true
     min_samples_per_class: 1
     max_samples_per_class: null
+  label_noise:
+    enabled: true
+    mode: symmetric
+    noise_rate: 0.2
+    seed_offset: 10000
+    client_noise_rates: null
 
 model:
   num_experts: 4

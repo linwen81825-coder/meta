@@ -2,19 +2,26 @@
 # ------------------------------------------------------------
 # FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
 #
+# 已有：
+#   1. 在训练集上先构造 long-tail class distribution
+#   2. 然后再把 long-tail 训练集划分给客户端
+#
 # 新增：
-#   在训练集上先构造 long-tail class distribution，
-#   然后再把 long-tail 训练集划分给客户端。
+#   每个客户端内部增加标签噪声 label noise。
 #
-# 当前 long-tail 支持：
-#   mode: geometric
-#       class0 = n_max
-#       class1 = n_max * decay_factor
-#       class2 = n_max * decay_factor^2
-#       ...
+# 标签噪声发生位置：
+#   原始训练集
+#   ↓
+#   long-tail 裁剪
+#   ↓
+#   Dirichlet 分客户端
+#   ↓
+#   每个客户端自己的 Dataset 内部加标签噪声
+#   ↓
+#   local_train
 #
-#   例如 decay_factor=0.9:
-#       5000, 4500, 4050, 3645, ...
+# 注意：
+#   server validation set 和 final test set 不加标签噪声。
 # ------------------------------------------------------------
 
 import argparse
@@ -28,7 +35,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 from model import (
@@ -266,54 +273,15 @@ def compute_long_tail_class_counts(
     """
     根据 long_tail 配置计算每个类别应该保留多少样本。
 
-    当前重点支持：
-
+    支持：
         mode: geometric
-
-    配置示例：
-
-        dataset:
-          long_tail:
-            enabled: true
-            mode: geometric
-            decay_factor: 0.9
-            class_order: natural
-            shuffle: true
-            min_samples_per_class: 1
-            max_samples_per_class: null
-
-    几何递减规则：
-
-        第 0 个头部类：
-            n_0 = n_max
-
-        第 1 个类：
-            n_1 = n_max * decay_factor
-
-        第 2 个类：
-            n_2 = n_max * decay_factor^2
-
-        第 r 个类：
-            n_r = n_max * decay_factor^r
-
-    如果 CIFAR10 每类原始 5000 张，decay_factor=0.9，则大概是：
-
-        class0: 5000
-        class1: 4500
-        class2: 4050
-        class3: 3645
-        class4: 3280
-        class5: 2952
-        class6: 2657
-        class7: 2391
-        class8: 2152
-        class9: 1937
+        mode: exp
+        mode: step
     """
     dataset_cfg = cfg["dataset"]
     long_tail_cfg = dataset_cfg.get("long_tail", {})
 
     num_classes = dataset_cfg["num_classes"]
-
     mode = long_tail_cfg.get("mode", "geometric")
 
     max_samples_per_class = long_tail_cfg.get("max_samples_per_class", None)
@@ -421,25 +389,6 @@ def compute_long_tail_class_counts(
 def build_long_tail_train_set(train_set, cfg, seed):
     """
     在训练集上构造 long-tail 类别分布。
-
-    输入：
-        原始 CIFAR10 train_set，每类通常 5000 张。
-
-    输出：
-        long_tail_train_set:
-            如果未启用 long_tail，就是原始 train_set。
-            如果启用，就是 Subset(train_set, selected_indices)。
-
-        long_tail_labels:
-            当前训练集对应的 labels。
-            后续 Dirichlet 客户端划分必须用这个 labels。
-
-    关键顺序：
-        原始训练集
-        ↓
-        long-tail 类别裁剪
-        ↓
-        Dirichlet 分给客户端
     """
     dataset_cfg = cfg["dataset"]
     long_tail_cfg = dataset_cfg.get("long_tail", {})
@@ -555,6 +504,268 @@ def build_long_tail_train_set(train_set, cfg, seed):
 
 
 # ------------------------------------------------------------
+# 6.6 客户端标签噪声
+# ------------------------------------------------------------
+def get_dataset_label(dataset, index):
+    """
+    递归获取 dataset 某个 index 的真实标签。
+
+    兼容：
+        CIFAR10
+        Subset(CIFAR10)
+        Subset(Subset(CIFAR10))
+    """
+    if isinstance(dataset, Subset):
+        real_index = dataset.indices[index]
+        return get_dataset_label(dataset.dataset, real_index)
+
+    if hasattr(dataset, "targets"):
+        return int(dataset.targets[index])
+
+    _, label = dataset[index]
+
+    return int(label)
+
+
+def get_client_noise_rate(label_noise_cfg, client_id, default_noise_rate):
+    """
+    获取某个客户端的标签噪声率。
+
+    如果配置了 client_noise_rates，就用每个客户端自己的噪声率。
+    否则所有客户端使用 noise_rate。
+    """
+    client_noise_rates = label_noise_cfg.get("client_noise_rates", None)
+
+    if client_noise_rates is None:
+        return float(default_noise_rate)
+
+    if not isinstance(client_noise_rates, (list, tuple)):
+        raise TypeError(
+            "dataset.label_noise.client_noise_rates 必须是 list，"
+            "例如 [0.0, 0.1, 0.2, ...]"
+        )
+
+    if client_id >= len(client_noise_rates):
+        raise ValueError(
+            f"client_noise_rates 长度不够: "
+            f"client_id={client_id}, len={len(client_noise_rates)}"
+        )
+
+    return float(client_noise_rates[client_id])
+
+
+def corrupt_labels(
+    clean_labels,
+    num_classes,
+    noise_rate,
+    mode,
+    seed,
+):
+    """
+    根据噪声率污染标签。
+
+    mode=symmetric:
+        以 noise_rate 概率，把标签随机翻成其他类别。
+
+    mode=pairflip:
+        以 noise_rate 概率，把 y 翻成 (y + 1) % num_classes。
+    """
+    if noise_rate < 0 or noise_rate > 1:
+        raise ValueError(
+            f"label noise_rate 必须在 [0, 1] 内，当前是 {noise_rate}"
+        )
+
+    if mode not in {"symmetric", "pairflip"}:
+        raise ValueError(
+            f"未知 label_noise mode={mode}，当前支持 symmetric / pairflip"
+        )
+
+    rng = np.random.default_rng(seed)
+
+    clean_labels = np.asarray(clean_labels, dtype=np.int64)
+    noisy_labels = clean_labels.copy()
+
+    num_samples = clean_labels.size
+
+    if noise_rate <= 0:
+        noise_mask = np.zeros(num_samples, dtype=bool)
+        return noisy_labels.tolist(), noise_mask
+
+    noise_mask = rng.random(num_samples) < noise_rate
+    noise_positions = np.where(noise_mask)[0]
+
+    if mode == "symmetric":
+        for pos in noise_positions:
+            old_label = int(clean_labels[pos])
+
+            # 从其他类别中随机选一个，避免翻回原标签。
+            candidate = rng.integers(0, num_classes - 1)
+
+            if candidate >= old_label:
+                candidate += 1
+
+            noisy_labels[pos] = int(candidate)
+
+    elif mode == "pairflip":
+        noisy_labels[noise_positions] = (
+            clean_labels[noise_positions] + 1
+        ) % num_classes
+
+    return noisy_labels.tolist(), noise_mask
+
+
+class ClientLabelNoiseDataset(Dataset):
+    """
+    单个客户端的数据集包装器。
+
+    它不会修改原始 CIFAR10 / Subset 的 targets。
+    只是在当前客户端内部维护一份 noisy_labels。
+
+    __getitem__ 返回：
+        image, noisy_label
+    """
+
+    def __init__(
+        self,
+        base_dataset,
+        indices,
+        num_classes,
+        noise_rate,
+        noise_mode,
+        seed,
+        client_id,
+    ):
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+        self.num_classes = int(num_classes)
+        self.noise_rate = float(noise_rate)
+        self.noise_mode = str(noise_mode)
+        self.seed = int(seed)
+        self.client_id = int(client_id)
+
+        self.clean_labels = [
+            get_dataset_label(self.base_dataset, index)
+            for index in self.indices
+        ]
+
+        self.noisy_labels, self.noise_mask = corrupt_labels(
+            clean_labels=self.clean_labels,
+            num_classes=self.num_classes,
+            noise_rate=self.noise_rate,
+            mode=self.noise_mode,
+            seed=self.seed,
+        )
+
+        self.num_noisy = int(np.sum(self.noise_mask))
+        self.actual_noise_rate = self.num_noisy / max(len(self.indices), 1)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item):
+        base_index = self.indices[item]
+        image, _ = self.base_dataset[base_index]
+        label = self.noisy_labels[item]
+
+        return image, label
+
+
+def build_client_dataset_with_optional_label_noise(
+    train_set,
+    indices,
+    cfg,
+    client_id,
+    seed,
+):
+    """
+    根据配置为单个客户端构建 Dataset。
+
+    如果未开启标签噪声：
+        返回 Subset(train_set, indices)
+
+    如果开启标签噪声：
+        返回 ClientLabelNoiseDataset(train_set, indices, ...)
+    """
+    dataset_cfg = cfg["dataset"]
+    label_noise_cfg = dataset_cfg.get("label_noise", {})
+
+    enabled = bool(label_noise_cfg.get("enabled", False))
+
+    if not enabled:
+        return Subset(train_set, indices), {
+            "enabled": False,
+            "noise_rate": 0.0,
+            "actual_noise_rate": 0.0,
+            "num_noisy": 0,
+            "num_samples": len(indices),
+        }
+
+    num_classes = int(dataset_cfg["num_classes"])
+    default_noise_rate = float(label_noise_cfg.get("noise_rate", 0.0))
+    noise_rate = get_client_noise_rate(
+        label_noise_cfg=label_noise_cfg,
+        client_id=client_id,
+        default_noise_rate=default_noise_rate,
+    )
+
+    noise_mode = label_noise_cfg.get("mode", "symmetric")
+    seed_offset = int(label_noise_cfg.get("seed_offset", 10000))
+
+    noise_seed = int(seed + seed_offset + client_id)
+
+    client_dataset = ClientLabelNoiseDataset(
+        base_dataset=train_set,
+        indices=indices,
+        num_classes=num_classes,
+        noise_rate=noise_rate,
+        noise_mode=noise_mode,
+        seed=noise_seed,
+        client_id=client_id,
+    )
+
+    info = {
+        "enabled": True,
+        "mode": noise_mode,
+        "noise_rate": noise_rate,
+        "actual_noise_rate": client_dataset.actual_noise_rate,
+        "num_noisy": client_dataset.num_noisy,
+        "num_samples": len(client_dataset),
+        "noise_seed": noise_seed,
+    }
+
+    return client_dataset, info
+
+
+def print_label_noise_summary(label_noise_infos):
+    """
+    打印每个客户端标签噪声情况。
+    """
+    if len(label_noise_infos) == 0:
+        return
+
+    enabled = any(info.get("enabled", False) for info in label_noise_infos)
+
+    print("========== 客户端标签噪声设置 ==========")
+
+    if not enabled:
+        print("dataset.label_noise.enabled = false，不添加标签噪声")
+        print("=======================================")
+        return
+
+    for client_id, info in enumerate(label_noise_infos):
+        print(
+            f"client {client_id:02d}: "
+            f"mode={info.get('mode', 'none')} | "
+            f"target_noise_rate={info.get('noise_rate', 0.0):.4f} | "
+            f"actual_noise_rate={info.get('actual_noise_rate', 0.0):.4f} | "
+            f"noisy={info.get('num_noisy', 0)}/{info.get('num_samples', 0)} | "
+            f"noise_seed={info.get('noise_seed', -1)}"
+        )
+
+    print("=======================================")
+
+
+# ------------------------------------------------------------
 # 7. 从测试集划分 class-balanced server validation set
 # ------------------------------------------------------------
 def split_server_validation_from_test_set(test_set, cfg, seed):
@@ -660,7 +871,7 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
 # ------------------------------------------------------------
 # 9. 构建每个客户端的 DataLoader
 # ------------------------------------------------------------
-def build_client_loaders(train_set, client_indices, cfg, device):
+def build_client_loaders(train_set, client_indices, cfg, device, seed):
     train_cfg = cfg["train"]
 
     batch_size = train_cfg["batch_size"]
@@ -668,9 +879,16 @@ def build_client_loaders(train_set, client_indices, cfg, device):
     pin_memory = device.type == "cuda"
 
     client_loaders = []
+    label_noise_infos = []
 
-    for indices in client_indices:
-        client_dataset = Subset(train_set, indices)
+    for client_id, indices in enumerate(client_indices):
+        client_dataset, noise_info = build_client_dataset_with_optional_label_noise(
+            train_set=train_set,
+            indices=indices,
+            cfg=cfg,
+            client_id=client_id,
+            seed=seed,
+        )
 
         loader = DataLoader(
             client_dataset,
@@ -681,6 +899,9 @@ def build_client_loaders(train_set, client_indices, cfg, device):
         )
 
         client_loaders.append(loader)
+        label_noise_infos.append(noise_info)
+
+    print_label_noise_summary(label_noise_infos)
 
     return client_loaders
 
@@ -1268,6 +1489,7 @@ def main():
         client_indices=client_indices,
         cfg=cfg,
         device=device,
+        seed=seed,
     )
 
     server_val_loader = build_server_val_loader(
@@ -1367,7 +1589,7 @@ def main():
         print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
         print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
         print(
-            "min_active_clients  : "
+            "min_active_clients : "
             f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
         )
 
