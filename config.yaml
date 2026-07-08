@@ -7,6 +7,14 @@ dataset:
   num_classes: 10
   num_clients: 10
   alpha: 0.1
+  long_tail:
+    enabled: true
+    mode: geometric
+    decay_factor: 0.9
+    class_order: natural
+    shuffle: true
+    min_samples_per_class: 1
+    max_samples_per_class: null
 
 model:
   num_experts: 4

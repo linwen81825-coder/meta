@@ -1,13 +1,20 @@
 # train.py
 # ------------------------------------------------------------
-# 最小版 FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
+# FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
 #
-# 路径规则：
-#   1. CIFAR10 数据集固定放在当前项目目录 ./data
-#   2. torchvision 的 download=True 会自动判断：
-#      - 如果 ./data 里已有 CIFAR10，就直接加载
-#      - 如果没有，就自动下载
-#   3. config.yaml 里的 dataset.data_root 只作为日志目录
+# 新增：
+#   在训练集上先构造 long-tail class distribution，
+#   然后再把 long-tail 训练集划分给客户端。
+#
+# 当前 long-tail 支持：
+#   mode: geometric
+#       class0 = n_max
+#       class1 = n_max * decay_factor
+#       class2 = n_max * decay_factor^2
+#       ...
+#
+#   例如 decay_factor=0.9:
+#       5000, 4500, 4050, 3645, ...
 # ------------------------------------------------------------
 
 import argparse
@@ -42,22 +49,10 @@ from meta_aggregator import (
 # 0. 路径工具
 # ------------------------------------------------------------
 def get_project_root():
-    """
-    当前项目根目录。
-
-    train.py 放在哪个目录，哪个目录就是项目根目录。
-    数据集固定放到：
-        项目根目录/data
-    """
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def make_abs_path(path, base_dir=None):
-    """
-    把路径转成绝对路径。
-
-    相对路径默认相对于当前项目根目录。
-    """
     path = os.path.expanduser(str(path))
 
     if os.path.isabs(path):
@@ -70,22 +65,10 @@ def make_abs_path(path, base_dir=None):
 
 
 def get_fixed_dataset_root():
-    """
-    固定数据集目录。
-
-    不再从 config.yaml 读取数据集路径。
-    CIFAR10 永远固定在：
-        当前项目目录/data
-    """
     return os.path.join(get_project_root(), "data")
 
 
 def get_log_root(cfg):
-    """
-    日志目录。
-
-    config.yaml 里的 dataset.data_root 现在只用来保存日志。
-    """
     dataset_cfg = cfg.get("dataset", {})
     log_root = dataset_cfg.get("data_root", "./runs/default")
     log_root = make_abs_path(log_root)
@@ -96,13 +79,6 @@ def get_log_root(cfg):
 
 
 def get_log_name_from_root(log_root):
-    """
-    根据日志目录自动生成日志文件名。
-
-    例如：
-        log_root = ./runs/b5f661
-        log_name = b5f661.log
-    """
     norm_root = os.path.normpath(log_root)
     run_name = os.path.basename(norm_root)
 
@@ -113,16 +89,6 @@ def get_log_name_from_root(log_root):
 
 
 def get_log_path(cfg):
-    """
-    日志文件路径。
-
-    规则：
-        dataset.data_root 的最后一级目录名作为日志文件名。
-
-    例如：
-        dataset.data_root: ./runs/b5f661
-        日志文件: ./runs/b5f661/b5f661.log
-    """
     log_root = get_log_root(cfg)
     log_name = get_log_name_from_root(log_root)
 
@@ -130,9 +96,6 @@ def get_log_path(cfg):
 
 
 def copy_config_to_log_root(config_path, cfg):
-    """
-    把本次使用的 config.yaml 复制到日志目录。
-    """
     if config_path is None:
         return None
 
@@ -148,13 +111,9 @@ def copy_config_to_log_root(config_path, cfg):
 
 
 # ------------------------------------------------------------
-# 1. 日志工具：同时打印到终端和保存到文件
+# 1. 日志工具
 # ------------------------------------------------------------
 class TeeLogger:
-    """
-    把 print() 的内容同时输出到终端和日志文件。
-    """
-
     def __init__(self, terminal, log_file):
         self.terminal = terminal
         self.log_file = log_file
@@ -171,16 +130,6 @@ class TeeLogger:
 
 
 def setup_logging(cfg, config_path=None):
-    """
-    开启日志保存。
-
-    每次运行都会覆盖当前日志文件。
-    日志文件名由 dataset.data_root 的最后一级目录名自动决定。
-
-    同时在日志开头打印：
-        日志开始时间
-        日志保存路径
-    """
     log_path = get_log_path(cfg)
 
     log_file = open(log_path, "w", encoding="utf-8")
@@ -210,9 +159,6 @@ def setup_logging(cfg, config_path=None):
 # 2. 读取配置文件
 # ------------------------------------------------------------
 def load_config(config_path):
-    """
-    读取 config.yaml。
-    """
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -223,9 +169,6 @@ def load_config(config_path):
 # 3. 固定随机种子
 # ------------------------------------------------------------
 def set_seed(seed):
-    """
-    固定随机种子。
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -236,9 +179,6 @@ def set_seed(seed):
 # 4. 选择设备
 # ------------------------------------------------------------
 def get_device(cfg):
-    """
-    根据配置选择 cuda 或 cpu。
-    """
     device_name = cfg.get("device", "cuda")
 
     if device_name == "cuda" and torch.cuda.is_available():
@@ -251,9 +191,6 @@ def get_device(cfg):
 # 5. 构建模型
 # ------------------------------------------------------------
 def build_model(cfg):
-    """
-    创建 ResNet18SwitchMoE 模型。
-    """
     model_cfg = cfg["model"]
     dataset_cfg = cfg["dataset"]
 
@@ -271,11 +208,6 @@ def build_model(cfg):
 # 6. 加载 CIFAR10 数据集
 # ------------------------------------------------------------
 def build_datasets(cfg):
-    """
-    加载 CIFAR10 训练集和测试集。
-
-    数据集固定在项目目录 ./data。
-    """
     dataset_cfg = cfg["dataset"]
     dataset_name = dataset_cfg.get("name", "cifar10").lower()
 
@@ -318,17 +250,314 @@ def build_datasets(cfg):
 
 
 # ------------------------------------------------------------
+# 6.5 在训练集上构造 long-tail 分布
+# ------------------------------------------------------------
+def get_subset_labels(labels, selected_indices):
+    labels = np.asarray(labels)
+    selected_indices = np.asarray(selected_indices, dtype=np.int64)
+
+    return labels[selected_indices].tolist()
+
+
+def compute_long_tail_class_counts(
+    original_class_counts,
+    cfg,
+):
+    """
+    根据 long_tail 配置计算每个类别应该保留多少样本。
+
+    当前重点支持：
+
+        mode: geometric
+
+    配置示例：
+
+        dataset:
+          long_tail:
+            enabled: true
+            mode: geometric
+            decay_factor: 0.9
+            class_order: natural
+            shuffle: true
+            min_samples_per_class: 1
+            max_samples_per_class: null
+
+    几何递减规则：
+
+        第 0 个头部类：
+            n_0 = n_max
+
+        第 1 个类：
+            n_1 = n_max * decay_factor
+
+        第 2 个类：
+            n_2 = n_max * decay_factor^2
+
+        第 r 个类：
+            n_r = n_max * decay_factor^r
+
+    如果 CIFAR10 每类原始 5000 张，decay_factor=0.9，则大概是：
+
+        class0: 5000
+        class1: 4500
+        class2: 4050
+        class3: 3645
+        class4: 3280
+        class5: 2952
+        class6: 2657
+        class7: 2391
+        class8: 2152
+        class9: 1937
+    """
+    dataset_cfg = cfg["dataset"]
+    long_tail_cfg = dataset_cfg.get("long_tail", {})
+
+    num_classes = dataset_cfg["num_classes"]
+
+    mode = long_tail_cfg.get("mode", "geometric")
+
+    max_samples_per_class = long_tail_cfg.get("max_samples_per_class", None)
+    min_samples_per_class = int(long_tail_cfg.get("min_samples_per_class", 1))
+
+    if min_samples_per_class < 1:
+        raise ValueError(
+            "dataset.long_tail.min_samples_per_class 必须 >= 1，"
+            f"当前是 {min_samples_per_class}"
+        )
+
+    original_class_counts = np.asarray(
+        original_class_counts,
+        dtype=np.int64,
+    )
+
+    if original_class_counts.size != num_classes:
+        raise ValueError(
+            f"original_class_counts 数量不一致: "
+            f"counts={original_class_counts.size}, num_classes={num_classes}"
+        )
+
+    if max_samples_per_class is None:
+        n_max = int(original_class_counts.min())
+    else:
+        n_max = int(max_samples_per_class)
+
+    if n_max <= 0:
+        raise ValueError(
+            f"long-tail n_max 必须大于 0，当前 n_max={n_max}"
+        )
+
+    n_max = min(
+        n_max,
+        int(original_class_counts.min()),
+    )
+
+    target_counts = []
+
+    if mode == "geometric":
+        decay_factor = float(long_tail_cfg.get("decay_factor", 0.9))
+
+        if decay_factor <= 0 or decay_factor > 1:
+            raise ValueError(
+                "dataset.long_tail.decay_factor 必须在 (0, 1] 内，"
+                f"当前是 {decay_factor}"
+            )
+
+        for rank in range(num_classes):
+            count = int(round(n_max * (decay_factor ** rank)))
+            count = max(min_samples_per_class, count)
+            target_counts.append(count)
+
+    elif mode == "exp":
+        imbalance_factor = float(long_tail_cfg.get("imbalance_factor", 0.1))
+
+        if imbalance_factor <= 0 or imbalance_factor > 1:
+            raise ValueError(
+                "dataset.long_tail.imbalance_factor 必须在 (0, 1] 内，"
+                f"当前是 {imbalance_factor}"
+            )
+
+        for rank in range(num_classes):
+            if num_classes == 1:
+                count = n_max
+            else:
+                exponent = rank / (num_classes - 1)
+                count = int(round(n_max * (imbalance_factor ** exponent)))
+
+            count = max(min_samples_per_class, count)
+            target_counts.append(count)
+
+    elif mode == "step":
+        imbalance_factor = float(long_tail_cfg.get("imbalance_factor", 0.1))
+
+        if imbalance_factor <= 0 or imbalance_factor > 1:
+            raise ValueError(
+                "dataset.long_tail.imbalance_factor 必须在 (0, 1] 内，"
+                f"当前是 {imbalance_factor}"
+            )
+
+        for rank in range(num_classes):
+            if rank < num_classes // 2:
+                count = n_max
+            else:
+                count = int(round(n_max * imbalance_factor))
+
+            count = max(min_samples_per_class, count)
+            target_counts.append(count)
+
+    else:
+        raise ValueError(
+            f"未知 long_tail mode={mode}，当前支持: "
+            "'geometric' / 'exp' / 'step'"
+        )
+
+    target_counts = np.asarray(
+        target_counts,
+        dtype=np.int64,
+    )
+
+    return target_counts
+
+
+def build_long_tail_train_set(train_set, cfg, seed):
+    """
+    在训练集上构造 long-tail 类别分布。
+
+    输入：
+        原始 CIFAR10 train_set，每类通常 5000 张。
+
+    输出：
+        long_tail_train_set:
+            如果未启用 long_tail，就是原始 train_set。
+            如果启用，就是 Subset(train_set, selected_indices)。
+
+        long_tail_labels:
+            当前训练集对应的 labels。
+            后续 Dirichlet 客户端划分必须用这个 labels。
+
+    关键顺序：
+        原始训练集
+        ↓
+        long-tail 类别裁剪
+        ↓
+        Dirichlet 分给客户端
+    """
+    dataset_cfg = cfg["dataset"]
+    long_tail_cfg = dataset_cfg.get("long_tail", {})
+
+    enabled = bool(long_tail_cfg.get("enabled", False))
+
+    labels = np.asarray(train_set.targets)
+    num_classes = dataset_cfg["num_classes"]
+
+    if not enabled:
+        print("========== 训练集 Long-tail 设置 ==========")
+        print("dataset.long_tail.enabled = false，不构造长尾训练集")
+        print(f"train samples: {len(train_set)}")
+        print("=========================================")
+
+        return train_set, labels.tolist()
+
+    rng = np.random.default_rng(seed)
+
+    original_class_counts = []
+
+    for class_id in range(num_classes):
+        class_count = int(np.sum(labels == class_id))
+        original_class_counts.append(class_count)
+
+    target_counts_by_rank = compute_long_tail_class_counts(
+        original_class_counts=original_class_counts,
+        cfg=cfg,
+    )
+
+    class_order = long_tail_cfg.get("class_order", "natural")
+    shuffle_selected = bool(long_tail_cfg.get("shuffle", True))
+
+    if class_order == "natural":
+        ordered_classes = list(range(num_classes))
+
+    elif class_order == "reverse":
+        ordered_classes = list(reversed(range(num_classes)))
+
+    elif class_order == "random":
+        ordered_classes = list(range(num_classes))
+        rng.shuffle(ordered_classes)
+
+    else:
+        raise ValueError(
+            "dataset.long_tail.class_order 只支持 "
+            "'natural' / 'reverse' / 'random'，"
+            f"当前是 {class_order}"
+        )
+
+    class_to_target_count = {}
+
+    for rank, class_id in enumerate(ordered_classes):
+        class_to_target_count[class_id] = int(target_counts_by_rank[rank])
+
+    selected_indices = []
+    selected_class_counts = []
+
+    for class_id in range(num_classes):
+        class_indices = np.where(labels == class_id)[0]
+        rng.shuffle(class_indices)
+
+        keep_count = class_to_target_count[class_id]
+        keep_count = min(
+            keep_count,
+            len(class_indices),
+        )
+
+        selected_class_indices = class_indices[:keep_count]
+
+        selected_indices.extend(selected_class_indices.tolist())
+        selected_class_counts.append(keep_count)
+
+    if shuffle_selected:
+        rng.shuffle(selected_indices)
+
+    long_tail_train_set = Subset(
+        train_set,
+        selected_indices,
+    )
+
+    long_tail_labels = get_subset_labels(
+        labels=labels,
+        selected_indices=selected_indices,
+    )
+
+    print("========== 训练集 Long-tail 设置 ==========")
+    print("dataset.long_tail.enabled : true")
+    print(f"mode                      : {long_tail_cfg.get('mode', 'geometric')}")
+
+    mode = long_tail_cfg.get("mode", "geometric")
+
+    if mode == "geometric":
+        print(f"decay_factor              : {float(long_tail_cfg.get('decay_factor', 0.9))}")
+    else:
+        print(f"imbalance_factor          : {float(long_tail_cfg.get('imbalance_factor', 0.1))}")
+
+    print(f"class_order               : {class_order}")
+    print(f"original train samples    : {len(train_set)}")
+    print(f"long-tail train samples   : {len(long_tail_train_set)}")
+    print("---------- 每类样本数 ----------")
+
+    for class_id in range(num_classes):
+        print(
+            f"class {class_id:02d}: "
+            f"original={int(original_class_counts[class_id])}, "
+            f"long_tail={int(selected_class_counts[class_id])}"
+        )
+
+    print("=========================================")
+
+    return long_tail_train_set, long_tail_labels
+
+
+# ------------------------------------------------------------
 # 7. 从测试集划分 class-balanced server validation set
 # ------------------------------------------------------------
 def split_server_validation_from_test_set(test_set, cfg, seed):
-    """
-    从 CIFAR10 测试集中划出服务器验证集。
-
-    当前数据流：
-        train_set 全部用于客户端训练；
-        test_set 先划出 server validation set；
-        剩下的 test_set 用于最终测试。
-    """
     server_cfg = cfg.get("server", {})
     dataset_cfg = cfg["dataset"]
 
@@ -394,9 +623,6 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
 # 8. Dirichlet non-IID 客户端划分
 # ------------------------------------------------------------
 def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
-    """
-    用 Dirichlet 分布划分 non-IID 客户端数据。
-    """
     rng = np.random.default_rng(seed)
 
     labels = np.array(labels)
@@ -435,9 +661,6 @@ def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
 # 9. 构建每个客户端的 DataLoader
 # ------------------------------------------------------------
 def build_client_loaders(train_set, client_indices, cfg, device):
-    """
-    根据客户端样本索引，构建每个客户端自己的 DataLoader。
-    """
     train_cfg = cfg["train"]
 
     batch_size = train_cfg["batch_size"]
@@ -466,9 +689,6 @@ def build_client_loaders(train_set, client_indices, cfg, device):
 # 10. 构建 server validation DataLoader
 # ------------------------------------------------------------
 def build_server_val_loader(server_val_set, cfg, device):
-    """
-    构建服务器验证集 DataLoader。
-    """
     if server_val_set is None:
         return None
 
@@ -498,9 +718,6 @@ def build_server_val_loader(server_val_set, cfg, device):
 # 11. 构建测试集 DataLoader
 # ------------------------------------------------------------
 def build_test_loader(test_set, cfg, device):
-    """
-    构建测试集 DataLoader。
-    """
     train_cfg = cfg["train"]
 
     batch_size = train_cfg.get("test_batch_size", 256)
@@ -522,9 +739,6 @@ def build_test_loader(test_set, cfg, device):
 # 12. Router balance loss
 # ------------------------------------------------------------
 def compute_router_balance_loss(router_probs):
-    """
-    计算 router balance loss，缓解 expert 激活塌缩。
-    """
     if router_probs.dim() == 3:
         num_experts = router_probs.size(-1)
         router_probs = router_probs.reshape(-1, num_experts)
@@ -554,16 +768,6 @@ def update_expert_loss_stats(
     per_sample_loss,
     info,
 ):
-    """
-    统计每个 expert 对应样本上的平均 CE loss。
-
-    top1:
-        一个样本只贡献给被选中的 expert。
-
-    top2/topk:
-        一个样本会贡献给 top-k expert。
-        这里用 topk_gates 作为权重。
-    """
     num_experts = expert_loss_sums.numel()
 
     loss_cpu = per_sample_loss.detach().cpu().float()
@@ -620,17 +824,6 @@ def update_expert_loss_stats(
 # 14. 本地训练
 # ------------------------------------------------------------
 def local_train(global_state_dict, train_loader, cfg, device):
-    """
-    单个客户端本地训练。
-
-    返回：
-        local_state_dict
-        num_samples
-        avg_loss
-        expert_freq
-        expert_count_values
-        expert_loss
-    """
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
 
@@ -731,8 +924,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
     expert_freq = counts_to_frequency(expert_counts)
     expert_freq = expert_freq.numpy().tolist()
 
-    # 原始 expert 激活次数。
-    # shape = [num_experts]
     expert_count_values = expert_counts.numpy().tolist()
 
     expert_loss_values = []
@@ -774,9 +965,6 @@ def local_train(global_state_dict, train_loader, cfg, device):
 # ------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, test_loader, device):
-    """
-    在测试集上评估全局模型。
-    """
     model.to(device)
     model.eval()
 
@@ -811,9 +999,6 @@ def evaluate(model, test_loader, device):
 # 16. 普通聚合权重
 # ------------------------------------------------------------
 def get_aggregation_weights(method, client_num_samples):
-    """
-    计算 uniform 或 sample_weighted 聚合权重。
-    """
     num_clients = len(client_num_samples)
 
     if method == "uniform":
@@ -834,22 +1019,6 @@ def get_expert_activation_count_weights(
     expert_id,
     num_clients,
 ):
-    """
-    按 expert 激活次数计算某一个 expert 的客户端聚合权重。
-
-    输入：
-        client_expert_counts:
-            shape = [num_clients, num_experts]
-
-        expert_id:
-            当前要聚合的 expert 编号。
-
-    权重：
-        weight_i,e = count_i,e / sum_j count_j,e
-
-    如果所有客户端该 expert 的激活次数都为 0，
-    就退回 uniform。
-    """
     if client_expert_counts is None:
         raise ValueError(
             "expert_agg=expert_activation_count_weighted 时，"
@@ -905,21 +1074,6 @@ def aggregate_state_dicts(
     cfg,
     client_expert_counts=None,
 ):
-    """
-    普通聚合函数。
-
-    non-expert 参数：
-        使用 non_expert_agg，例如 uniform / sample_weighted。
-
-    expert 参数：
-        支持：
-            uniform
-            sample_weighted
-            expert_activation_count_weighted
-
-    expert_activation_count_weighted：
-        对每个 expert 单独按激活次数加权。
-    """
     agg_cfg = cfg["aggregation"]
 
     non_expert_method = agg_cfg["non_expert_agg"]
@@ -1021,9 +1175,6 @@ def aggregate_state_dicts(
 # 18. 打印客户端划分信息
 # ------------------------------------------------------------
 def print_partition_summary(client_indices):
-    """
-    打印每个客户端有多少样本。
-    """
     print("========== 客户端数据划分 ==========")
 
     for client_id, indices in enumerate(client_indices):
@@ -1036,9 +1187,6 @@ def print_partition_summary(client_indices):
 # 19. 打印元网络输出 alpha
 # ------------------------------------------------------------
 def print_meta_alpha(alpha):
-    """
-    打印元网络输出的专家聚合权重。
-    """
     if alpha is None:
         return
 
@@ -1092,6 +1240,12 @@ def main():
 
     train_set, test_set = build_datasets(cfg)
 
+    train_set, train_labels = build_long_tail_train_set(
+        train_set=train_set,
+        cfg=cfg,
+        seed=seed,
+    )
+
     server_val_set, final_test_set = split_server_validation_from_test_set(
         test_set=test_set,
         cfg=cfg,
@@ -1101,7 +1255,7 @@ def main():
     dataset_cfg = cfg["dataset"]
 
     client_indices = dirichlet_partition(
-        labels=train_set.targets,
+        labels=train_labels,
         num_clients=dataset_cfg["num_clients"],
         alpha=dataset_cfg["alpha"],
         seed=seed,
@@ -1213,7 +1367,7 @@ def main():
         print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
         print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
         print(
-            "min_active_clients : "
+            "min_active_clients  : "
             f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
         )
 
@@ -1229,7 +1383,6 @@ def main():
             for name, tensor in global_model.state_dict().items()
         }
 
-        # 当前版本保持固定顺序：选前 clients_per_round 个客户端。
         selected_clients = list(range(clients_per_round))
 
         client_state_dicts = []
