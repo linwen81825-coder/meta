@@ -2,34 +2,36 @@
 # ------------------------------------------------------------
 # FL + ResNet18 + Switch-MoE + Meta Expert Aggregation
 #
-# 已有：
-#   1. 在训练集上先构造 long-tail class distribution
-#   2. 然后再把 long-tail 训练集划分给客户端
+# Reproducibility additions:
+# 1. Strict deterministic PyTorch/CUDA configuration.
+# 2. Independent, stable RNG streams for model initialization, Meta
+#    initialization, every round/client DataLoader, and local training.
+# 3. DataLoader order is independent of whether Meta or a baseline is used.
+# 4. Dirichlet partition failure raises an error instead of silently returning
+#    an invalid final attempt.
+# 5. Reproducibility metadata and hashes are written only to the log file.
 #
-# 新增：
-#   每个客户端内部增加标签噪声 label noise。
-#
-# 标签噪声发生位置：
-#   原始训练集
-#   ↓
-#   long-tail 裁剪
-#   ↓
-#   Dirichlet 分客户端
-#   ↓
-#   每个客户端自己的 Dataset 内部加标签噪声
-#   ↓
-#   local_train
-#
-# 注意：
-#   server validation set 和 final test set 不加标签噪声。
+# The model, aggregation rules, Meta features, server-validation split, and
+# training objective are unchanged from commit
+# 531f009ba17bd5fe7e02dfc094151fe509d7e55a.
 # ------------------------------------------------------------
 
-import argparse
+# This variable must be configured before CUDA creates a cuBLAS context.
 import os
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import argparse
+import hashlib
+import json
+import platform
 import random
 import shutil
+import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -38,186 +40,425 @@ import yaml
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
+from meta_aggregator import (
+    MetaExpertAggregator,
+    counts_to_frequency,
+    get_expert_id_from_name,
+    update_expert_counts,
+)
 from model import (
     ResNet18SwitchMoE,
     is_expert_param,
     print_trainable_param_stats,
 )
 
-from meta_aggregator import (
-    MetaExpertAggregator,
-    update_expert_counts,
-    counts_to_frequency,
-    get_expert_id_from_name,
-)
+
+# ------------------------------------------------------------
+# Constants and global log handle
+# ------------------------------------------------------------
+
+SOURCE_COMMIT = "531f009ba17bd5fe7e02dfc094151fe509d7e55a"
+_ACTIVE_LOGGER = None
+
+# Stable namespaces. Adding a new module should use a new namespace instead of
+# consuming another component's RNG stream.
+SEED_NAMESPACES = {
+    "model_init": "model_init_v1",
+    "meta_init": "meta_init_v1",
+    "client_loader": "client_loader_v1",
+    "local_train": "local_train_v1",
+    "server_val_loader": "server_val_loader_v1",
+    "test_loader": "test_loader_v1",
+    "meta_round": "meta_round_v1",
+    "evaluation": "evaluation_v1",
+}
 
 
 # ------------------------------------------------------------
-# 0. 路径工具
+# Path utilities
 # ------------------------------------------------------------
-def get_project_root():
+
+def get_project_root() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def make_abs_path(path, base_dir=None):
+def make_abs_path(path: str, base_dir: Optional[str] = None) -> str:
     path = os.path.expanduser(str(path))
-
     if os.path.isabs(path):
         return os.path.abspath(path)
-
     if base_dir is None:
         base_dir = get_project_root()
-
     return os.path.abspath(os.path.join(base_dir, path))
 
 
-def get_fixed_dataset_root():
+def get_fixed_dataset_root() -> str:
     return os.path.join(get_project_root(), "data")
 
 
-def get_log_root(cfg):
+def get_log_root(cfg: Mapping) -> str:
+    # Keep the original commit's path behavior.
     dataset_cfg = cfg.get("dataset", {})
     log_root = dataset_cfg.get("data_root", "./runs/default")
     log_root = make_abs_path(log_root)
-
     os.makedirs(log_root, exist_ok=True)
-
     return log_root
 
 
-def get_log_name_from_root(log_root):
-    norm_root = os.path.normpath(log_root)
-    run_name = os.path.basename(norm_root)
-
-    if run_name == "":
-        run_name = "train"
-
+def get_log_name_from_root(log_root: str) -> str:
+    run_name = os.path.basename(os.path.normpath(log_root)) or "train"
     return f"{run_name}.log"
 
 
-def get_log_path(cfg):
+def get_log_path(cfg: Mapping) -> str:
     log_root = get_log_root(cfg)
-    log_name = get_log_name_from_root(log_root)
-
-    return os.path.join(log_root, log_name)
+    return os.path.join(log_root, get_log_name_from_root(log_root))
 
 
-def copy_config_to_log_root(config_path, cfg):
-    if config_path is None:
+def copy_config_to_log_root(
+    config_path: Optional[str],
+    cfg: Mapping,
+) -> Optional[str]:
+    if config_path is None or not os.path.isfile(config_path):
         return None
-
-    if not os.path.isfile(config_path):
-        return None
-
-    log_root = get_log_root(cfg)
-    dst_path = os.path.join(log_root, "config_used.yaml")
-
-    shutil.copy2(config_path, dst_path)
-
-    return dst_path
+    destination = os.path.join(get_log_root(cfg), "config_used.yaml")
+    shutil.copy2(config_path, destination)
+    return destination
 
 
 # ------------------------------------------------------------
-# 1. 日志工具
+# Logging
 # ------------------------------------------------------------
+
 class TeeLogger:
+    """Write normal training output to both terminal and log."""
+
     def __init__(self, terminal, log_file):
         self.terminal = terminal
         self.log_file = log_file
 
-    def write(self, message):
+    def write(self, message: str) -> None:
         self.terminal.write(message)
         self.log_file.write(message)
         self.terminal.flush()
         self.log_file.flush()
 
-    def flush(self):
+    def write_log_only(self, message: str) -> None:
+        self.log_file.write(message)
+        self.log_file.flush()
+
+    def flush(self) -> None:
         self.terminal.flush()
         self.log_file.flush()
 
 
-def setup_logging(cfg, config_path=None):
+def setup_logging(cfg: Mapping, config_path: Optional[str] = None) -> str:
+    global _ACTIVE_LOGGER
+
     log_path = get_log_path(cfg)
-
     log_file = open(log_path, "w", encoding="utf-8")
-
-    sys.stdout = TeeLogger(sys.__stdout__, log_file)
-    sys.stderr = TeeLogger(sys.__stderr__, log_file)
-
+    _ACTIVE_LOGGER = TeeLogger(sys.__stdout__, log_file)
+    sys.stdout = _ACTIVE_LOGGER
+    sys.stderr = _ACTIVE_LOGGER
     copy_config_to_log_root(config_path, cfg)
 
-    display_log_path = os.path.relpath(
-        log_path,
-        get_project_root(),
-    )
-
-    if not display_log_path.startswith("."):
-        display_log_path = f"./{display_log_path}"
+    display_path = os.path.relpath(log_path, get_project_root())
+    if not display_path.startswith("."):
+        display_path = f"./{display_path}"
 
     print("=" * 80)
     print(f"日志开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"日志保存路径: {display_log_path}")
+    print(f"日志保存路径: {display_path}")
     print("=" * 80)
-
     return log_path
 
 
-# ------------------------------------------------------------
-# 2. 读取配置文件
-# ------------------------------------------------------------
-def load_config(config_path):
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+def log_only(message: str = "") -> None:
+    """Write new reproducibility diagnostics only to the log file."""
+    if _ACTIVE_LOGGER is None:
+        return
+    if not message.endswith("\n"):
+        message += "\n"
+    _ACTIVE_LOGGER.write_log_only(message)
 
+
+# ------------------------------------------------------------
+# Configuration and reproducibility
+# ------------------------------------------------------------
+
+def load_config(config_path: str) -> Dict:
+    with open(config_path, "r", encoding="utf-8") as file:
+        cfg = yaml.safe_load(file)
+    if not isinstance(cfg, dict):
+        raise ValueError("配置文件内容必须是 YAML mapping")
     return cfg
 
 
-# ------------------------------------------------------------
-# 3. 固定随机种子
-# ------------------------------------------------------------
-def set_seed(seed):
+def get_reproducibility_cfg(cfg: Mapping) -> Dict[str, object]:
+    """
+    Reproducibility is enabled by default, so an existing config file works
+    without modification.
+    """
+    user_cfg = cfg.get("reproducibility", {})
+    if user_cfg is None:
+        user_cfg = {}
+    if not isinstance(user_cfg, Mapping):
+        raise TypeError("reproducibility 必须是 YAML mapping")
+
+    return {
+        "enabled": bool(user_cfg.get("enabled", True)),
+        "strict_determinism": bool(
+            user_cfg.get("strict_determinism", True)
+        ),
+        "force_num_workers_zero": bool(
+            user_cfg.get("force_num_workers_zero", True)
+        ),
+        "disable_tf32": bool(user_cfg.get("disable_tf32", True)),
+        "log_environment": bool(user_cfg.get("log_environment", True)),
+        "log_initial_state_hash": bool(
+            user_cfg.get("log_initial_state_hash", True)
+        ),
+        "log_first_round_client_hashes": bool(
+            user_cfg.get("log_first_round_client_hashes", True)
+        ),
+        "log_global_state_hash_each_round": bool(
+            user_cfg.get("log_global_state_hash_each_round", True)
+        ),
+    }
+
+
+def set_seed(seed: int, repro_cfg: Mapping) -> None:
+    seed = int(seed)
+
+    # PYTHONHASHSEED is most effective when exported before Python starts.
+    # This project avoids Python's randomized hash for seed derivation, but the
+    # value is still recorded for child processes and environment provenance.
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if not bool(repro_cfg.get("enabled", True)):
+        return
+
+    strict = bool(repro_cfg.get("strict_determinism", True))
+    if strict:
+        # warn_only=False is intentional. A non-deterministic operation should
+        # fail loudly instead of silently invalidating a reproducibility run.
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = False
+
+    if bool(repro_cfg.get("disable_tf32", True)):
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("highest")
+
+
+def stable_seed(base_seed: int, namespace: str, *parts: object) -> int:
+    """Derive a stable 63-bit seed without using Python's randomized hash."""
+    payload = "|".join(
+        [str(int(base_seed)), str(namespace)] + [str(part) for part in parts]
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    return value % (2**63 - 1)
+
+
+def get_fork_rng_devices(device: torch.device) -> List[int]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return []
+    if device.index is not None:
+        return [int(device.index)]
+    return [int(torch.cuda.current_device())]
+
+
+@contextmanager
+def isolated_rng(seed: int, device: torch.device):
+    """
+    Run a component with its own CPU/CUDA default RNG state, then restore the
+    caller's RNG state. This supports modules such as Dropout that do not accept
+    an explicit torch.Generator.
+    """
+    devices = get_fork_rng_devices(device)
+    with torch.random.fork_rng(devices=devices, enabled=True):
+        random_state = random.getstate()
+        numpy_state = np.random.get_state()
+        try:
+            random.seed(int(seed))
+            np.random.seed(int(seed) % (2**32))
+            torch.manual_seed(int(seed))
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.manual_seed(int(seed))
+                torch.cuda.manual_seed_all(int(seed))
+            yield
+        finally:
+            random.setstate(random_state)
+            np.random.set_state(numpy_state)
+
+
+def seed_dataloader_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def canonical_json_hash(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def hash_integer_sequences(sequences: Sequence[Sequence[int]]) -> str:
+    digest = hashlib.sha256()
+    for sequence_id, sequence in enumerate(sequences):
+        array = np.asarray(sequence, dtype=np.int64)
+        digest.update(str(sequence_id).encode("utf-8"))
+        digest.update(str(array.shape).encode("utf-8"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def hash_state_dict(state_dict: Mapping[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(state_dict.keys()):
+        tensor = state_dict[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        # view(uint8) handles floating and integer tensors uniformly.
+        byte_tensor = tensor.reshape(-1).view(torch.uint8)
+        digest.update(byte_tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def hash_file(path: str) -> str:
+    if not os.path.isfile(path):
+        return "missing"
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while True:
+            chunk = file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_command_text(command: Sequence[str]) -> str:
+    try:
+        return subprocess.check_output(
+            list(command),
+            cwd=get_project_root(),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def log_reproducibility_environment(
+    cfg: Mapping,
+    config_path: str,
+    seed: int,
+    device: torch.device,
+    repro_cfg: Mapping,
+) -> None:
+    if not bool(repro_cfg.get("log_environment", True)):
+        return
+
+    git_commit = run_command_text(["git", "rev-parse", "HEAD"])
+    git_status = run_command_text(["git", "status", "--porcelain"])
+    git_dirty = "unknown" if git_status == "unknown" else bool(git_status)
+
+    source_files = {
+        "train.py": hash_file(os.path.join(get_project_root(), "train.py")),
+        "model.py": hash_file(os.path.join(get_project_root(), "model.py")),
+        "meta_aggregator.py": hash_file(
+            os.path.join(get_project_root(), "meta_aggregator.py")
+        ),
+        "config": hash_file(make_abs_path(config_path, os.getcwd())),
+    }
+
+    log_only("========== [REPRO] 环境与配置 ==========")
+    log_only(f"[REPRO] source_commit_reference={SOURCE_COMMIT}")
+    log_only(f"[REPRO] git_commit={git_commit}")
+    log_only(f"[REPRO] git_dirty={git_dirty}")
+    log_only(f"[REPRO] seed={int(seed)}")
+    log_only(f"[REPRO] device={device}")
+    log_only(f"[REPRO] python={platform.python_version()}")
+    log_only(f"[REPRO] platform={platform.platform()}")
+    log_only(f"[REPRO] torch={torch.__version__}")
+    log_only(f"[REPRO] cuda_runtime={torch.version.cuda}")
+    log_only(f"[REPRO] cudnn={torch.backends.cudnn.version()}")
+    if torch.cuda.is_available():
+        log_only(f"[REPRO] gpu={torch.cuda.get_device_name(device)}")
+    log_only(
+        "[REPRO] deterministic_algorithms="
+        f"{torch.are_deterministic_algorithms_enabled()}"
+    )
+    log_only(
+        f"[REPRO] cudnn_deterministic={torch.backends.cudnn.deterministic}"
+    )
+    log_only(f"[REPRO] cudnn_benchmark={torch.backends.cudnn.benchmark}")
+    log_only(
+        f"[REPRO] cuda_matmul_allow_tf32="
+        f"{torch.backends.cuda.matmul.allow_tf32}"
+    )
+    log_only(f"[REPRO] cudnn_allow_tf32={torch.backends.cudnn.allow_tf32}")
+    log_only(
+        f"[REPRO] CUBLAS_WORKSPACE_CONFIG="
+        f"{os.environ.get('CUBLAS_WORKSPACE_CONFIG', '')}"
+    )
+    log_only(f"[REPRO] effective_config_hash={canonical_json_hash(cfg)}")
+    for name, digest in source_files.items():
+        log_only(f"[REPRO] file_sha256[{name}]={digest}")
+    log_only(f"[REPRO] options={json.dumps(dict(repro_cfg), sort_keys=True)}")
+    log_only("==========================================")
 
 
 # ------------------------------------------------------------
-# 4. 选择设备
+# Device and model
 # ------------------------------------------------------------
-def get_device(cfg):
-    device_name = cfg.get("device", "cuda")
 
+def get_device(cfg: Mapping) -> torch.device:
+    device_name = str(cfg.get("device", "cuda"))
     if device_name == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
-
     return torch.device("cpu")
 
 
-# ------------------------------------------------------------
-# 5. 构建模型
-# ------------------------------------------------------------
-def build_model(cfg):
+def build_model(cfg: Mapping) -> ResNet18SwitchMoE:
     model_cfg = cfg["model"]
     dataset_cfg = cfg["dataset"]
-
-    model = ResNet18SwitchMoE(
-        num_classes=dataset_cfg["num_classes"],
-        num_experts=model_cfg["num_experts"],
-        expert_hidden_dim=model_cfg["expert_hidden_dim"],
-        top_k=model_cfg.get("top_k", 1),
+    return ResNet18SwitchMoE(
+        num_classes=int(dataset_cfg["num_classes"]),
+        num_experts=int(model_cfg["num_experts"]),
+        expert_hidden_dim=int(model_cfg["expert_hidden_dim"]),
+        top_k=int(model_cfg.get("top_k", 1)),
     )
 
-    return model
-
 
 # ------------------------------------------------------------
-# 6. 加载 CIFAR10 数据集
+# CIFAR-10 and long-tail training set
 # ------------------------------------------------------------
-def build_datasets(cfg):
+
+def build_datasets(cfg: Mapping):
     dataset_cfg = cfg["dataset"]
-    dataset_name = dataset_cfg.get("name", "cifar10").lower()
-
+    dataset_name = str(dataset_cfg.get("name", "cifar10")).lower()
     if dataset_name != "cifar10":
         raise ValueError(f"当前代码只支持 cifar10，收到 dataset.name={dataset_name}")
 
@@ -228,12 +469,10 @@ def build_datasets(cfg):
         mean=(0.4914, 0.4822, 0.4465),
         std=(0.2023, 0.1994, 0.2010),
     )
-
     train_transform = transforms.Compose([
         transforms.ToTensor(),
         normalize,
     ])
-
     test_transform = transforms.Compose([
         transforms.ToTensor(),
         normalize,
@@ -245,395 +484,239 @@ def build_datasets(cfg):
         download=True,
         transform=train_transform,
     )
-
     test_set = datasets.CIFAR10(
         root=data_root,
         train=False,
         download=True,
         transform=test_transform,
     )
-
     return train_set, test_set
 
 
-# ------------------------------------------------------------
-# 6.5 在训练集上构造 long-tail 分布
-# ------------------------------------------------------------
-def get_subset_labels(labels, selected_indices):
-    labels = np.asarray(labels)
-    selected_indices = np.asarray(selected_indices, dtype=np.int64)
-
-    return labels[selected_indices].tolist()
+def get_subset_labels(
+    labels: Sequence[int],
+    selected_indices: Sequence[int],
+) -> List[int]:
+    labels_array = np.asarray(labels)
+    selected = np.asarray(selected_indices, dtype=np.int64)
+    return labels_array[selected].tolist()
 
 
 def compute_long_tail_class_counts(
-    original_class_counts,
-    cfg,
-):
-    """
-    根据 long_tail 配置计算每个类别应该保留多少样本。
-
-    支持：
-        mode: geometric
-        mode: exp
-        mode: step
-    """
+    original_class_counts: Sequence[int],
+    cfg: Mapping,
+) -> np.ndarray:
     dataset_cfg = cfg["dataset"]
     long_tail_cfg = dataset_cfg.get("long_tail", {})
+    num_classes = int(dataset_cfg["num_classes"])
+    mode = str(long_tail_cfg.get("mode", "geometric"))
+    max_samples = long_tail_cfg.get("max_samples_per_class", None)
+    min_samples = int(long_tail_cfg.get("min_samples_per_class", 1))
 
-    num_classes = dataset_cfg["num_classes"]
-    mode = long_tail_cfg.get("mode", "geometric")
+    if min_samples < 1:
+        raise ValueError("dataset.long_tail.min_samples_per_class 必须 >= 1")
 
-    max_samples_per_class = long_tail_cfg.get("max_samples_per_class", None)
-    min_samples_per_class = int(long_tail_cfg.get("min_samples_per_class", 1))
+    original = np.asarray(original_class_counts, dtype=np.int64)
+    if original.size != num_classes:
+        raise ValueError("original_class_counts 数量与 num_classes 不一致")
 
-    if min_samples_per_class < 1:
-        raise ValueError(
-            "dataset.long_tail.min_samples_per_class 必须 >= 1，"
-            f"当前是 {min_samples_per_class}"
-        )
-
-    original_class_counts = np.asarray(
-        original_class_counts,
-        dtype=np.int64,
-    )
-
-    if original_class_counts.size != num_classes:
-        raise ValueError(
-            f"original_class_counts 数量不一致: "
-            f"counts={original_class_counts.size}, num_classes={num_classes}"
-        )
-
-    if max_samples_per_class is None:
-        n_max = int(original_class_counts.min())
+    if max_samples is None:
+        n_max = int(original.min())
     else:
-        n_max = int(max_samples_per_class)
-
+        n_max = min(int(max_samples), int(original.min()))
     if n_max <= 0:
-        raise ValueError(
-            f"long-tail n_max 必须大于 0，当前 n_max={n_max}"
-        )
+        raise ValueError("long-tail 最大类别样本数必须大于 0")
 
-    n_max = min(
-        n_max,
-        int(original_class_counts.min()),
-    )
-
-    target_counts = []
-
+    target_counts: List[int] = []
     if mode == "geometric":
         decay_factor = float(long_tail_cfg.get("decay_factor", 0.9))
-
-        if decay_factor <= 0 or decay_factor > 1:
-            raise ValueError(
-                "dataset.long_tail.decay_factor 必须在 (0, 1] 内，"
-                f"当前是 {decay_factor}"
-            )
-
+        if not 0 < decay_factor <= 1:
+            raise ValueError("long_tail.decay_factor 必须在 (0, 1] 内")
         for rank in range(num_classes):
-            count = int(round(n_max * (decay_factor ** rank)))
-            count = max(min_samples_per_class, count)
-            target_counts.append(count)
-
+            target_counts.append(
+                max(min_samples, int(round(n_max * decay_factor**rank)))
+            )
     elif mode == "exp":
         imbalance_factor = float(long_tail_cfg.get("imbalance_factor", 0.1))
-
-        if imbalance_factor <= 0 or imbalance_factor > 1:
-            raise ValueError(
-                "dataset.long_tail.imbalance_factor 必须在 (0, 1] 内，"
-                f"当前是 {imbalance_factor}"
-            )
-
+        if not 0 < imbalance_factor <= 1:
+            raise ValueError("long_tail.imbalance_factor 必须在 (0, 1] 内")
         for rank in range(num_classes):
-            if num_classes == 1:
-                count = n_max
-            else:
-                exponent = rank / (num_classes - 1)
-                count = int(round(n_max * (imbalance_factor ** exponent)))
-
-            count = max(min_samples_per_class, count)
-            target_counts.append(count)
-
+            exponent = 0.0 if num_classes == 1 else rank / (num_classes - 1)
+            target_counts.append(
+                max(
+                    min_samples,
+                    int(round(n_max * imbalance_factor**exponent)),
+                )
+            )
     elif mode == "step":
         imbalance_factor = float(long_tail_cfg.get("imbalance_factor", 0.1))
-
-        if imbalance_factor <= 0 or imbalance_factor > 1:
-            raise ValueError(
-                "dataset.long_tail.imbalance_factor 必须在 (0, 1] 内，"
-                f"当前是 {imbalance_factor}"
-            )
-
+        if not 0 < imbalance_factor <= 1:
+            raise ValueError("long_tail.imbalance_factor 必须在 (0, 1] 内")
         for rank in range(num_classes):
-            if rank < num_classes // 2:
-                count = n_max
-            else:
-                count = int(round(n_max * imbalance_factor))
-
-            count = max(min_samples_per_class, count)
-            target_counts.append(count)
-
+            value = (
+                n_max
+                if rank < num_classes // 2
+                else int(round(n_max * imbalance_factor))
+            )
+            target_counts.append(max(min_samples, value))
     else:
         raise ValueError(
-            f"未知 long_tail mode={mode}，当前支持: "
-            "'geometric' / 'exp' / 'step'"
+            f"未知 long_tail mode={mode}; 支持 geometric / exp / step"
         )
 
-    target_counts = np.asarray(
-        target_counts,
-        dtype=np.int64,
-    )
-
-    return target_counts
+    return np.asarray(target_counts, dtype=np.int64)
 
 
-def build_long_tail_train_set(train_set, cfg, seed):
-    """
-    在训练集上构造 long-tail 类别分布。
-    """
+def build_long_tail_train_set(
+    train_set,
+    cfg: Mapping,
+    seed: int,
+):
     dataset_cfg = cfg["dataset"]
     long_tail_cfg = dataset_cfg.get("long_tail", {})
-
     enabled = bool(long_tail_cfg.get("enabled", False))
-
     labels = np.asarray(train_set.targets)
-    num_classes = dataset_cfg["num_classes"]
+    num_classes = int(dataset_cfg["num_classes"])
 
     if not enabled:
         print("========== 训练集 Long-tail 设置 ==========")
         print("dataset.long_tail.enabled = false，不构造长尾训练集")
         print(f"train samples: {len(train_set)}")
         print("=========================================")
-
+        log_only(
+            f"[REPRO] long_tail_indices_hash="
+            f"{hash_integer_sequences([list(range(len(train_set)))])}"
+        )
         return train_set, labels.tolist()
 
-    rng = np.random.default_rng(seed)
+    # The original code already used a local NumPy Generator. Keeping the same
+    # seed preserves the original long-tail sample realization.
+    rng = np.random.default_rng(int(seed))
+    original_counts = [
+        int(np.sum(labels == class_id)) for class_id in range(num_classes)
+    ]
+    target_by_rank = compute_long_tail_class_counts(original_counts, cfg)
 
-    original_class_counts = []
-
-    for class_id in range(num_classes):
-        class_count = int(np.sum(labels == class_id))
-        original_class_counts.append(class_count)
-
-    target_counts_by_rank = compute_long_tail_class_counts(
-        original_class_counts=original_class_counts,
-        cfg=cfg,
-    )
-
-    class_order = long_tail_cfg.get("class_order", "natural")
-    shuffle_selected = bool(long_tail_cfg.get("shuffle", True))
-
+    class_order = str(long_tail_cfg.get("class_order", "natural"))
     if class_order == "natural":
         ordered_classes = list(range(num_classes))
-
     elif class_order == "reverse":
         ordered_classes = list(reversed(range(num_classes)))
-
     elif class_order == "random":
         ordered_classes = list(range(num_classes))
         rng.shuffle(ordered_classes)
-
     else:
-        raise ValueError(
-            "dataset.long_tail.class_order 只支持 "
-            "'natural' / 'reverse' / 'random'，"
-            f"当前是 {class_order}"
-        )
+        raise ValueError("long_tail.class_order 仅支持 natural/reverse/random")
 
-    class_to_target_count = {}
+    class_to_target = {
+        class_id: int(target_by_rank[rank])
+        for rank, class_id in enumerate(ordered_classes)
+    }
 
-    for rank, class_id in enumerate(ordered_classes):
-        class_to_target_count[class_id] = int(target_counts_by_rank[rank])
-
-    selected_indices = []
-    selected_class_counts = []
-
+    selected_indices: List[int] = []
+    selected_counts: List[int] = []
     for class_id in range(num_classes):
         class_indices = np.where(labels == class_id)[0]
         rng.shuffle(class_indices)
+        keep_count = min(class_to_target[class_id], len(class_indices))
+        selected_indices.extend(class_indices[:keep_count].tolist())
+        selected_counts.append(keep_count)
 
-        keep_count = class_to_target_count[class_id]
-        keep_count = min(
-            keep_count,
-            len(class_indices),
-        )
-
-        selected_class_indices = class_indices[:keep_count]
-
-        selected_indices.extend(selected_class_indices.tolist())
-        selected_class_counts.append(keep_count)
-
-    if shuffle_selected:
+    if bool(long_tail_cfg.get("shuffle", True)):
         rng.shuffle(selected_indices)
 
-    long_tail_train_set = Subset(
-        train_set,
-        selected_indices,
-    )
-
-    long_tail_labels = get_subset_labels(
-        labels=labels,
-        selected_indices=selected_indices,
-    )
+    subset = Subset(train_set, selected_indices)
+    subset_labels = get_subset_labels(labels, selected_indices)
 
     print("========== 训练集 Long-tail 设置 ==========")
     print("dataset.long_tail.enabled : true")
-    print(f"mode                      : {long_tail_cfg.get('mode', 'geometric')}")
-
-    mode = long_tail_cfg.get("mode", "geometric")
-
-    if mode == "geometric":
-        print(f"decay_factor              : {float(long_tail_cfg.get('decay_factor', 0.9))}")
-    else:
-        print(f"imbalance_factor          : {float(long_tail_cfg.get('imbalance_factor', 0.1))}")
-
-    print(f"class_order               : {class_order}")
-    print(f"original train samples    : {len(train_set)}")
-    print(f"long-tail train samples   : {len(long_tail_train_set)}")
-    print("---------- 每类样本数 ----------")
-
+    print(f"mode : {long_tail_cfg.get('mode', 'geometric')}")
+    print(f"class_order : {class_order}")
+    print(f"original train samples : {len(train_set)}")
+    print(f"long-tail train samples : {len(subset)}")
     for class_id in range(num_classes):
         print(
-            f"class {class_id:02d}: "
-            f"original={int(original_class_counts[class_id])}, "
-            f"long_tail={int(selected_class_counts[class_id])}"
+            f"class {class_id:02d}: original={original_counts[class_id]}, "
+            f"long_tail={selected_counts[class_id]}"
         )
-
     print("=========================================")
 
-    return long_tail_train_set, long_tail_labels
+    log_only(
+        f"[REPRO] long_tail_indices_hash="
+        f"{hash_integer_sequences([selected_indices])}"
+    )
+    return subset, subset_labels
 
 
 # ------------------------------------------------------------
-# 6.6 客户端标签噪声
+# Client label noise
 # ------------------------------------------------------------
-def get_dataset_label(dataset, index):
-    """
-    递归获取 dataset 某个 index 的真实标签。
 
-    兼容：
-        CIFAR10
-        Subset(CIFAR10)
-        Subset(Subset(CIFAR10))
-    """
+def get_dataset_label(dataset, index: int) -> int:
     if isinstance(dataset, Subset):
-        real_index = dataset.indices[index]
-        return get_dataset_label(dataset.dataset, real_index)
-
+        return get_dataset_label(dataset.dataset, dataset.indices[index])
     if hasattr(dataset, "targets"):
         return int(dataset.targets[index])
-
     _, label = dataset[index]
-
     return int(label)
 
 
-def get_client_noise_rate(label_noise_cfg, client_id, default_noise_rate):
-    """
-    获取某个客户端的标签噪声率。
-
-    如果配置了 client_noise_rates，就用每个客户端自己的噪声率。
-    否则所有客户端使用 noise_rate。
-    """
-    client_noise_rates = label_noise_cfg.get("client_noise_rates", None)
-
-    if client_noise_rates is None:
+def get_client_noise_rate(
+    label_noise_cfg: Mapping,
+    client_id: int,
+    default_noise_rate: float,
+) -> float:
+    rates = label_noise_cfg.get("client_noise_rates", None)
+    if rates is None:
         return float(default_noise_rate)
-
-    if not isinstance(client_noise_rates, (list, tuple)):
-        raise TypeError(
-            "dataset.label_noise.client_noise_rates 必须是 list，"
-            "例如 [0.0, 0.1, 0.2, ...]"
-        )
-
-    if client_id >= len(client_noise_rates):
-        raise ValueError(
-            f"client_noise_rates 长度不够: "
-            f"client_id={client_id}, len={len(client_noise_rates)}"
-        )
-
-    return float(client_noise_rates[client_id])
+    if not isinstance(rates, (list, tuple)):
+        raise TypeError("client_noise_rates 必须是 list")
+    if client_id >= len(rates):
+        raise ValueError("client_noise_rates 长度不足")
+    return float(rates[client_id])
 
 
 def corrupt_labels(
-    clean_labels,
-    num_classes,
-    noise_rate,
-    mode,
-    seed,
-):
-    """
-    根据噪声率污染标签。
-
-    mode=symmetric:
-        以 noise_rate 概率，把标签随机翻成其他类别。
-
-    mode=pairflip:
-        以 noise_rate 概率，把 y 翻成 (y + 1) % num_classes。
-    """
-    if noise_rate < 0 or noise_rate > 1:
-        raise ValueError(
-            f"label noise_rate 必须在 [0, 1] 内，当前是 {noise_rate}"
-        )
-
+    clean_labels: Sequence[int],
+    num_classes: int,
+    noise_rate: float,
+    mode: str,
+    seed: int,
+) -> Tuple[List[int], np.ndarray]:
+    if not 0 <= noise_rate <= 1:
+        raise ValueError("label noise_rate 必须在 [0, 1] 内")
     if mode not in {"symmetric", "pairflip"}:
-        raise ValueError(
-            f"未知 label_noise mode={mode}，当前支持 symmetric / pairflip"
-        )
+        raise ValueError("label_noise.mode 仅支持 symmetric / pairflip")
 
-    rng = np.random.default_rng(seed)
-
-    clean_labels = np.asarray(clean_labels, dtype=np.int64)
-    noisy_labels = clean_labels.copy()
-
-    num_samples = clean_labels.size
-
-    if noise_rate <= 0:
-        noise_mask = np.zeros(num_samples, dtype=bool)
-        return noisy_labels.tolist(), noise_mask
-
-    noise_mask = rng.random(num_samples) < noise_rate
-    noise_positions = np.where(noise_mask)[0]
+    rng = np.random.default_rng(int(seed))
+    clean = np.asarray(clean_labels, dtype=np.int64)
+    noisy = clean.copy()
+    mask = rng.random(clean.size) < noise_rate
+    positions = np.where(mask)[0]
 
     if mode == "symmetric":
-        for pos in noise_positions:
-            old_label = int(clean_labels[pos])
-
-            # 从其他类别中随机选一个，避免翻回原标签。
-            candidate = rng.integers(0, num_classes - 1)
-
+        for position in positions:
+            old_label = int(clean[position])
+            candidate = int(rng.integers(0, num_classes - 1))
             if candidate >= old_label:
                 candidate += 1
+            noisy[position] = candidate
+    else:
+        noisy[positions] = (clean[positions] + 1) % num_classes
 
-            noisy_labels[pos] = int(candidate)
-
-    elif mode == "pairflip":
-        noisy_labels[noise_positions] = (
-            clean_labels[noise_positions] + 1
-        ) % num_classes
-
-    return noisy_labels.tolist(), noise_mask
+    return noisy.tolist(), mask
 
 
 class ClientLabelNoiseDataset(Dataset):
-    """
-    单个客户端的数据集包装器。
-
-    它不会修改原始 CIFAR10 / Subset 的 targets。
-    只是在当前客户端内部维护一份 noisy_labels。
-
-    __getitem__ 返回：
-        image, noisy_label
-    """
-
     def __init__(
         self,
         base_dataset,
-        indices,
-        num_classes,
-        noise_rate,
-        noise_mode,
-        seed,
-        client_id,
+        indices: Sequence[int],
+        num_classes: int,
+        noise_rate: float,
+        noise_mode: str,
+        seed: int,
+        client_id: int,
     ):
         self.base_dataset = base_dataset
         self.indices = list(indices)
@@ -644,10 +727,8 @@ class ClientLabelNoiseDataset(Dataset):
         self.client_id = int(client_id)
 
         self.clean_labels = [
-            get_dataset_label(self.base_dataset, index)
-            for index in self.indices
+            get_dataset_label(base_dataset, index) for index in self.indices
         ]
-
         self.noisy_labels, self.noise_mask = corrupt_labels(
             clean_labels=self.clean_labels,
             num_classes=self.num_classes,
@@ -655,41 +736,27 @@ class ClientLabelNoiseDataset(Dataset):
             mode=self.noise_mode,
             seed=self.seed,
         )
-
         self.num_noisy = int(np.sum(self.noise_mask))
         self.actual_noise_rate = self.num_noisy / max(len(self.indices), 1)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, item):
-        base_index = self.indices[item]
-        image, _ = self.base_dataset[base_index]
-        label = self.noisy_labels[item]
-
-        return image, label
+    def __getitem__(self, item: int):
+        image, _ = self.base_dataset[self.indices[item]]
+        return image, self.noisy_labels[item]
 
 
 def build_client_dataset_with_optional_label_noise(
     train_set,
-    indices,
-    cfg,
-    client_id,
-    seed,
+    indices: Sequence[int],
+    cfg: Mapping,
+    client_id: int,
+    seed: int,
 ):
-    """
-    根据配置为单个客户端构建 Dataset。
-
-    如果未开启标签噪声：
-        返回 Subset(train_set, indices)
-
-    如果开启标签噪声：
-        返回 ClientLabelNoiseDataset(train_set, indices, ...)
-    """
     dataset_cfg = cfg["dataset"]
-    label_noise_cfg = dataset_cfg.get("label_noise", {})
-
-    enabled = bool(label_noise_cfg.get("enabled", False))
+    noise_cfg = dataset_cfg.get("label_noise", {})
+    enabled = bool(noise_cfg.get("enabled", False))
 
     if not enabled:
         return Subset(train_set, indices), {
@@ -700,30 +767,25 @@ def build_client_dataset_with_optional_label_noise(
             "num_samples": len(indices),
         }
 
-    num_classes = int(dataset_cfg["num_classes"])
-    default_noise_rate = float(label_noise_cfg.get("noise_rate", 0.0))
     noise_rate = get_client_noise_rate(
-        label_noise_cfg=label_noise_cfg,
+        label_noise_cfg=noise_cfg,
         client_id=client_id,
-        default_noise_rate=default_noise_rate,
+        default_noise_rate=float(noise_cfg.get("noise_rate", 0.0)),
     )
-
-    noise_mode = label_noise_cfg.get("mode", "symmetric")
-    seed_offset = int(label_noise_cfg.get("seed_offset", 10000))
-
-    noise_seed = int(seed + seed_offset + client_id)
+    noise_mode = str(noise_cfg.get("mode", "symmetric"))
+    # Preserve the exact seed formula from the supplied commit.
+    noise_seed = int(seed + int(noise_cfg.get("seed_offset", 10000)) + client_id)
 
     client_dataset = ClientLabelNoiseDataset(
         base_dataset=train_set,
         indices=indices,
-        num_classes=num_classes,
+        num_classes=int(dataset_cfg["num_classes"]),
         noise_rate=noise_rate,
         noise_mode=noise_mode,
         seed=noise_seed,
         client_id=client_id,
     )
-
-    info = {
+    return client_dataset, {
         "enabled": True,
         "mode": noise_mode,
         "noise_rate": noise_rate,
@@ -733,63 +795,58 @@ def build_client_dataset_with_optional_label_noise(
         "noise_seed": noise_seed,
     }
 
-    return client_dataset, info
 
-
-def print_label_noise_summary(label_noise_infos):
-    """
-    打印每个客户端标签噪声情况。
-    """
-    if len(label_noise_infos) == 0:
+def print_label_noise_summary(infos: Sequence[Mapping]) -> None:
+    if not infos:
         return
-
-    enabled = any(info.get("enabled", False) for info in label_noise_infos)
-
     print("========== 客户端标签噪声设置 ==========")
-
-    if not enabled:
+    if not any(bool(info.get("enabled", False)) for info in infos):
         print("dataset.label_noise.enabled = false，不添加标签噪声")
-        print("=======================================")
-        return
-
-    for client_id, info in enumerate(label_noise_infos):
-        print(
-            f"client {client_id:02d}: "
-            f"mode={info.get('mode', 'none')} | "
-            f"target_noise_rate={info.get('noise_rate', 0.0):.4f} | "
-            f"actual_noise_rate={info.get('actual_noise_rate', 0.0):.4f} | "
-            f"noisy={info.get('num_noisy', 0)}/{info.get('num_samples', 0)} | "
-            f"noise_seed={info.get('noise_seed', -1)}"
-        )
-
+    else:
+        for client_id, info in enumerate(infos):
+            print(
+                f"client {client_id:02d}: "
+                f"mode={info.get('mode', 'none')} | "
+                f"target_noise_rate={info.get('noise_rate', 0.0):.4f} | "
+                f"actual_noise_rate={info.get('actual_noise_rate', 0.0):.4f} | "
+                f"noisy={info.get('num_noisy', 0)}/"
+                f"{info.get('num_samples', 0)} | "
+                f"noise_seed={info.get('noise_seed', -1)}"
+            )
     print("=======================================")
 
 
 # ------------------------------------------------------------
-# 7. 从测试集划分 class-balanced server validation set
+# Server validation/final-test split
 # ------------------------------------------------------------
-def split_server_validation_from_test_set(test_set, cfg, seed):
+
+def split_server_validation_from_test_set(
+    test_set,
+    cfg: Mapping,
+    seed: int,
+):
     server_cfg = cfg.get("server", {})
     dataset_cfg = cfg["dataset"]
-
-    val_size = server_cfg.get("val_size", 1000)
-    num_classes = dataset_cfg["num_classes"]
+    val_size = int(server_cfg.get("val_size", 1000))
+    num_classes = int(dataset_cfg["num_classes"])
     total_size = len(test_set)
 
     if val_size <= 0:
         server_val_set = None
         final_test_set = test_set
-
         print("========== Server 验证集划分 ==========")
         print("server.val_size <= 0，不划分 server validation set")
         print(f"final test samples: {len(final_test_set)}")
         print("======================================")
-
+        log_only("[REPRO] server_val_indices_hash=none")
+        log_only(
+            f"[REPRO] final_test_indices_hash="
+            f"{hash_integer_sequences([list(range(total_size))])}"
+        )
         return server_val_set, final_test_set
 
     if val_size >= total_size:
         raise ValueError("server.val_size 不能大于等于测试集大小")
-
     if val_size % num_classes != 0:
         raise ValueError(
             "为了做 class-balanced server validation set，"
@@ -797,22 +854,17 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
         )
 
     samples_per_class = val_size // num_classes
+    # Preserve the original split realization.
+    rng = np.random.default_rng(int(seed))
+    labels = np.asarray(test_set.targets)
 
-    rng = np.random.default_rng(seed)
-    labels = np.array(test_set.targets)
-
-    server_val_indices = []
-    final_test_indices = []
-
+    server_val_indices: List[int] = []
+    final_test_indices: List[int] = []
     for class_id in range(num_classes):
         class_indices = np.where(labels == class_id)[0]
         rng.shuffle(class_indices)
-
-        class_val_indices = class_indices[:samples_per_class]
-        class_test_indices = class_indices[samples_per_class:]
-
-        server_val_indices.extend(class_val_indices.tolist())
-        final_test_indices.extend(class_test_indices.tolist())
+        server_val_indices.extend(class_indices[:samples_per_class].tolist())
+        final_test_indices.extend(class_indices[samples_per_class:].tolist())
 
     rng.shuffle(server_val_indices)
     rng.shuffle(final_test_indices)
@@ -827,175 +879,253 @@ def split_server_validation_from_test_set(test_set, cfg, seed):
     print(f"server val per class     : {samples_per_class}")
     print("======================================")
 
+    log_only(
+        f"[REPRO] server_val_indices_hash="
+        f"{hash_integer_sequences([server_val_indices])}"
+    )
+    log_only(
+        f"[REPRO] final_test_indices_hash="
+        f"{hash_integer_sequences([final_test_indices])}"
+    )
     return server_val_set, final_test_set
 
 
 # ------------------------------------------------------------
-# 8. Dirichlet non-IID 客户端划分
+# Dirichlet non-IID partition
 # ------------------------------------------------------------
-def dirichlet_partition(labels, num_clients, alpha, seed, min_size=10):
-    rng = np.random.default_rng(seed)
 
-    labels = np.array(labels)
-    num_classes = int(labels.max()) + 1
+def dirichlet_partition(
+    labels: Sequence[int],
+    num_clients: int,
+    alpha: float,
+    seed: int,
+    min_size: int = 10,
+    max_attempts: int = 100,
+) -> List[List[int]]:
+    if num_clients <= 0:
+        raise ValueError("num_clients 必须大于 0")
+    if alpha <= 0:
+        raise ValueError("Dirichlet alpha 必须大于 0")
+    if min_size < 0:
+        raise ValueError("min_size 不能为负数")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts 必须大于 0")
 
-    for _ in range(100):
-        client_indices = [[] for _ in range(num_clients)]
+    rng = np.random.default_rng(int(seed))
+    labels_array = np.asarray(labels)
+    if labels_array.size == 0:
+        raise ValueError("labels 不能为空")
+    num_classes = int(labels_array.max()) + 1
+
+    last_sizes: Optional[List[int]] = None
+    for attempt in range(1, max_attempts + 1):
+        client_indices: List[List[int]] = [
+            [] for _ in range(num_clients)
+        ]
 
         for class_id in range(num_classes):
-            class_indices = np.where(labels == class_id)[0]
+            class_indices = np.where(labels_array == class_id)[0]
             rng.shuffle(class_indices)
-
             proportions = rng.dirichlet(alpha * np.ones(num_clients))
-
             split_points = (
                 np.cumsum(proportions)[:-1] * len(class_indices)
             ).astype(int)
-
             class_splits = np.split(class_indices, split_points)
-
             for client_id, split in enumerate(class_splits):
                 client_indices[client_id].extend(split.tolist())
 
-        client_sizes = [len(indices) for indices in client_indices]
+        last_sizes = [len(indices) for indices in client_indices]
+        if min(last_sizes) >= min_size:
+            for client_id in range(num_clients):
+                rng.shuffle(client_indices[client_id])
+            log_only(f"[REPRO] dirichlet_attempts={attempt}")
+            log_only(
+                f"[REPRO] client_partition_hash="
+                f"{hash_integer_sequences(client_indices)}"
+            )
+            return client_indices
 
-        if min(client_sizes) >= min_size:
-            break
-
-    for client_id in range(num_clients):
-        rng.shuffle(client_indices[client_id])
-
-    return client_indices
+    raise RuntimeError(
+        "Dirichlet 客户端划分失败："
+        f"尝试 {max_attempts} 次后仍有客户端少于 {min_size} 个样本；"
+        f"最后一次客户端大小={last_sizes}。请增大 alpha、减小客户端数或"
+        "调整 long-tail 设置。"
+    )
 
 
 # ------------------------------------------------------------
-# 9. 构建每个客户端的 DataLoader
+# Dataset and DataLoader construction
 # ------------------------------------------------------------
-def build_client_loaders(train_set, client_indices, cfg, device, seed):
-    train_cfg = cfg["train"]
 
-    batch_size = train_cfg["batch_size"]
-    num_workers = train_cfg.get("num_workers", 2)
-    pin_memory = device.type == "cuda"
-
-    client_loaders = []
-    label_noise_infos = []
+def build_client_datasets(
+    train_set,
+    client_indices: Sequence[Sequence[int]],
+    cfg: Mapping,
+    seed: int,
+) -> List[Dataset]:
+    client_datasets: List[Dataset] = []
+    label_noise_infos: List[Mapping] = []
 
     for client_id, indices in enumerate(client_indices):
-        client_dataset, noise_info = build_client_dataset_with_optional_label_noise(
-            train_set=train_set,
-            indices=indices,
-            cfg=cfg,
-            client_id=client_id,
-            seed=seed,
+        client_dataset, noise_info = (
+            build_client_dataset_with_optional_label_noise(
+                train_set=train_set,
+                indices=indices,
+                cfg=cfg,
+                client_id=client_id,
+                seed=seed,
+            )
         )
-
-        loader = DataLoader(
-            client_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
-
-        client_loaders.append(loader)
+        client_datasets.append(client_dataset)
         label_noise_infos.append(noise_info)
 
     print_label_noise_summary(label_noise_infos)
+    log_only(
+        f"[REPRO] label_noise_info_hash="
+        f"{canonical_json_hash(label_noise_infos)}"
+    )
+    return client_datasets
 
-    return client_loaders
+
+def get_effective_num_workers(
+    cfg: Mapping,
+    repro_cfg: Mapping,
+) -> int:
+    requested = int(cfg["train"].get("num_workers", 2))
+    if (
+        bool(repro_cfg.get("enabled", True))
+        and bool(repro_cfg.get("force_num_workers_zero", True))
+    ):
+        return 0
+    return requested
 
 
-# ------------------------------------------------------------
-# 10. 构建 server validation DataLoader
-# ------------------------------------------------------------
-def build_server_val_loader(server_val_set, cfg, device):
+def build_client_loader_for_round(
+    client_dataset: Dataset,
+    cfg: Mapping,
+    device: torch.device,
+    base_seed: int,
+    round_id: int,
+    client_id: int,
+    repro_cfg: Mapping,
+) -> DataLoader:
+    train_cfg = cfg["train"]
+    num_workers = get_effective_num_workers(cfg, repro_cfg)
+    pin_memory = device.type == "cuda"
+
+    loader_seed = stable_seed(
+        base_seed,
+        SEED_NAMESPACES["client_loader"],
+        round_id,
+        client_id,
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(loader_seed)
+
+    return DataLoader(
+        client_dataset,
+        batch_size=int(train_cfg["batch_size"]),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        worker_init_fn=seed_dataloader_worker,
+        generator=generator,
+        persistent_workers=False,
+    )
+
+
+def build_server_val_loader(
+    server_val_set,
+    cfg: Mapping,
+    device: torch.device,
+    base_seed: int,
+    repro_cfg: Mapping,
+) -> Optional[DataLoader]:
     if server_val_set is None:
         return None
 
     train_cfg = cfg["train"]
     server_cfg = cfg.get("server", {})
-
-    batch_size = server_cfg.get(
-        "val_batch_size",
-        train_cfg.get("test_batch_size", 256),
+    batch_size = int(
+        server_cfg.get(
+            "val_batch_size",
+            train_cfg.get("test_batch_size", 256),
+        )
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(
+        stable_seed(base_seed, SEED_NAMESPACES["server_val_loader"])
     )
 
-    num_workers = train_cfg.get("num_workers", 2)
-    pin_memory = device.type == "cuda"
-
-    loader = DataLoader(
+    return DataLoader(
         server_val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        num_workers=get_effective_num_workers(cfg, repro_cfg),
+        pin_memory=device.type == "cuda",
+        worker_init_fn=seed_dataloader_worker,
+        generator=generator,
+        persistent_workers=False,
     )
 
-    return loader
 
-
-# ------------------------------------------------------------
-# 11. 构建测试集 DataLoader
-# ------------------------------------------------------------
-def build_test_loader(test_set, cfg, device):
+def build_test_loader(
+    test_set,
+    cfg: Mapping,
+    device: torch.device,
+    base_seed: int,
+    repro_cfg: Mapping,
+) -> DataLoader:
     train_cfg = cfg["train"]
-
-    batch_size = train_cfg.get("test_batch_size", 256)
-    num_workers = train_cfg.get("num_workers", 2)
-    pin_memory = device.type == "cuda"
-
-    test_loader = DataLoader(
-        test_set,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(
+        stable_seed(base_seed, SEED_NAMESPACES["test_loader"])
     )
 
-    return test_loader
+    return DataLoader(
+        test_set,
+        batch_size=int(train_cfg.get("test_batch_size", 256)),
+        shuffle=False,
+        num_workers=get_effective_num_workers(cfg, repro_cfg),
+        pin_memory=device.type == "cuda",
+        worker_init_fn=seed_dataloader_worker,
+        generator=generator,
+        persistent_workers=False,
+    )
 
 
 # ------------------------------------------------------------
-# 12. Router balance loss
+# Router balance loss and expert statistics
 # ------------------------------------------------------------
-def compute_router_balance_loss(router_probs):
+
+def compute_router_balance_loss(router_probs: torch.Tensor) -> torch.Tensor:
     if router_probs.dim() == 3:
         num_experts = router_probs.size(-1)
         router_probs = router_probs.reshape(-1, num_experts)
-
     elif router_probs.dim() == 2:
         num_experts = router_probs.size(-1)
-
     else:
         raise ValueError(
-            f"router_probs 维度不对，期望 [B, E] 或 [B, T, E]，实际是 {router_probs.shape}"
+            "router_probs 维度不对，期望 [B, E] 或 [B, T, E]，"
+            f"实际是 {router_probs.shape}"
         )
 
     mean_probs = router_probs.mean(dim=0)
     target_probs = torch.ones_like(mean_probs) / num_experts
-
-    balance_loss = torch.sum((mean_probs - target_probs) ** 2)
-
-    return balance_loss
+    return torch.sum((mean_probs - target_probs) ** 2)
 
 
-# ------------------------------------------------------------
-# 13. 统计 expert_loss
-# ------------------------------------------------------------
 def update_expert_loss_stats(
-    expert_loss_sums,
-    expert_loss_weights,
-    per_sample_loss,
-    info,
-):
+    expert_loss_sums: torch.Tensor,
+    expert_loss_weights: torch.Tensor,
+    per_sample_loss: torch.Tensor,
+    info: Mapping[str, torch.Tensor],
+) -> None:
     num_experts = expert_loss_sums.numel()
-
     loss_cpu = per_sample_loss.detach().cpu().float()
 
     if "topk_indices" in info:
         expert_indices = info["topk_indices"].detach().cpu()
-
         if "topk_gates" in info:
             expert_gates = info["topk_gates"].detach().cpu().float()
         else:
@@ -1006,32 +1136,26 @@ def update_expert_loss_stats(
             expert_gates = expert_gates / expert_gates.size(1)
 
         loss_expand = loss_cpu.unsqueeze(1).expand_as(expert_gates)
-
         flat_indices = expert_indices.reshape(-1)
         flat_gates = expert_gates.reshape(-1)
         flat_losses = loss_expand.reshape(-1)
-
         loss_sum = torch.bincount(
             flat_indices,
             weights=flat_losses * flat_gates,
             minlength=num_experts,
         )
-
         weight_sum = torch.bincount(
             flat_indices,
             weights=flat_gates,
             minlength=num_experts,
         )
-
     else:
         expert_indices = info["top1_indices"].detach().cpu().reshape(-1)
-
         loss_sum = torch.bincount(
             expert_indices,
             weights=loss_cpu,
             minlength=num_experts,
         )
-
         weight_sum = torch.bincount(
             expert_indices,
             minlength=num_experts,
@@ -1042,134 +1166,128 @@ def update_expert_loss_stats(
 
 
 # ------------------------------------------------------------
-# 14. 本地训练
+# Local training
 # ------------------------------------------------------------
-def local_train(global_state_dict, train_loader, cfg, device):
+
+def local_train(
+    global_state_dict: Mapping[str, torch.Tensor],
+    train_loader: DataLoader,
+    cfg: Mapping,
+    device: torch.device,
+    base_seed: int,
+    round_id: int,
+    client_id: int,
+):
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
-
-    num_experts = model_cfg["num_experts"]
-    router_balance_weight = train_cfg.get("router_balance_weight", 0.0)
-
-    model = build_model(cfg)
-    model.load_state_dict(global_state_dict)
-    model.to(device)
-    model.train()
-
-    criterion = nn.CrossEntropyLoss(reduction="none")
-
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=train_cfg["lr"],
-        momentum=train_cfg.get("momentum", 0.9),
-        weight_decay=train_cfg.get("weight_decay", 0.0005),
+    num_experts = int(model_cfg["num_experts"])
+    router_balance_weight = float(
+        train_cfg.get("router_balance_weight", 0.0)
     )
 
-    total_loss = 0.0
-    total_samples = 0
-
-    expert_counts = torch.zeros(
-        num_experts,
-        dtype=torch.long,
+    local_seed = stable_seed(
+        base_seed,
+        SEED_NAMESPACES["local_train"],
+        round_id,
+        client_id,
     )
 
-    expert_loss_sums = torch.zeros(
-        num_experts,
-        dtype=torch.float32,
-    )
+    # Isolate both model-construction RNG consumption and any future stochastic
+    # training modules such as Dropout or randomized routing.
+    with isolated_rng(local_seed, device):
+        model = build_model(cfg)
+        model.load_state_dict(global_state_dict, strict=True)
+        model.to(device)
+        model.train()
 
-    expert_loss_weights = torch.zeros(
-        num_experts,
-        dtype=torch.float32,
-    )
+        criterion = nn.CrossEntropyLoss(reduction="none")
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=float(train_cfg["lr"]),
+            momentum=float(train_cfg.get("momentum", 0.9)),
+            weight_decay=float(train_cfg.get("weight_decay", 0.0005)),
+        )
 
-    local_epochs = train_cfg["local_epochs"]
+        total_loss = 0.0
+        total_samples = 0
+        expert_counts = torch.zeros(num_experts, dtype=torch.long)
+        expert_loss_sums = torch.zeros(num_experts, dtype=torch.float32)
+        expert_loss_weights = torch.zeros(num_experts, dtype=torch.float32)
 
-    for _ in range(local_epochs):
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad()
-
-            logits, info = model(images, return_info=True)
-
-            if "topk_indices" in info:
-                expert_indices = info["topk_indices"]
-            else:
-                expert_indices = info["top1_indices"]
-
-            update_expert_counts(
-                expert_counts=expert_counts,
-                expert_indices=expert_indices,
-            )
-
-            per_sample_ce_loss = criterion(logits, labels)
-            ce_loss = per_sample_ce_loss.mean()
-
-            update_expert_loss_stats(
-                expert_loss_sums=expert_loss_sums,
-                expert_loss_weights=expert_loss_weights,
-                per_sample_loss=per_sample_ce_loss,
-                info=info,
-            )
-
-            balance_loss = torch.tensor(
-                0.0,
-                device=device,
-            )
-
-            if router_balance_weight > 0:
-                if "router_probs" not in info:
-                    raise ValueError(
-                        "model(images, return_info=True) 没有返回 router_probs，"
-                        "请先在 model.py 的 info 里加入 router_probs。"
-                    )
-
-                balance_loss = compute_router_balance_loss(
-                    info["router_probs"]
+        local_epochs = int(train_cfg["local_epochs"])
+        for _ in range(local_epochs):
+            for images, labels in train_loader:
+                images = images.to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                )
+                labels = labels.to(
+                    device,
+                    non_blocking=device.type == "cuda",
                 )
 
-            loss = ce_loss + router_balance_weight * balance_loss
+                optimizer.zero_grad()
+                logits, info = model(images, return_info=True)
 
-            loss.backward()
-            optimizer.step()
+                if "topk_indices" in info:
+                    expert_indices = info["topk_indices"]
+                else:
+                    expert_indices = info["top1_indices"]
+                update_expert_counts(
+                    expert_counts=expert_counts,
+                    expert_indices=expert_indices,
+                )
 
-            batch_size = images.size(0)
+                per_sample_ce_loss = criterion(logits, labels)
+                ce_loss = per_sample_ce_loss.mean()
+                update_expert_loss_stats(
+                    expert_loss_sums=expert_loss_sums,
+                    expert_loss_weights=expert_loss_weights,
+                    per_sample_loss=per_sample_ce_loss,
+                    info=info,
+                )
 
-            total_loss += per_sample_ce_loss.detach().sum().item()
-            total_samples += batch_size
+                balance_loss = torch.tensor(0.0, device=device)
+                if router_balance_weight > 0:
+                    if "router_probs" not in info:
+                        raise ValueError(
+                            "model(images, return_info=True) 没有返回 "
+                            "router_probs，请先在 model.py 的 info 中加入。"
+                        )
+                    balance_loss = compute_router_balance_loss(
+                        info["router_probs"]
+                    )
 
-    avg_loss = total_loss / max(total_samples, 1)
+                loss = ce_loss + router_balance_weight * balance_loss
+                loss.backward()
+                optimizer.step()
 
-    expert_freq = counts_to_frequency(expert_counts)
-    expert_freq = expert_freq.numpy().tolist()
+                batch_size = images.size(0)
+                total_loss += per_sample_ce_loss.detach().sum().item()
+                total_samples += batch_size
 
-    expert_count_values = expert_counts.numpy().tolist()
+        avg_loss = total_loss / max(total_samples, 1)
+        expert_freq = counts_to_frequency(expert_counts).numpy().tolist()
+        expert_count_values = expert_counts.numpy().tolist()
 
-    expert_loss_values = []
+        expert_loss_values: List[float] = []
+        for expert_id in range(num_experts):
+            weight = expert_loss_weights[expert_id].item()
+            if weight > 0:
+                value = expert_loss_sums[expert_id].item() / weight
+            else:
+                value = avg_loss
+            expert_loss_values.append(float(value))
 
-    for expert_id in range(num_experts):
-        weight = expert_loss_weights[expert_id].item()
+        local_state_dict = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()
+        }
+        num_samples = len(train_loader.dataset)
 
-        if weight > 0:
-            value = expert_loss_sums[expert_id].item() / weight
-        else:
-            value = avg_loss
-
-        expert_loss_values.append(float(value))
-
-    local_state_dict = {
-        name: tensor.detach().cpu().clone()
-        for name, tensor in model.state_dict().items()
-    }
-
-    num_samples = len(train_loader.dataset)
-
-    del model
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     return (
         local_state_dict,
@@ -1182,13 +1300,17 @@ def local_train(global_state_dict, train_loader, cfg, device):
 
 
 # ------------------------------------------------------------
-# 15. 测试全局模型
+# Evaluation
 # ------------------------------------------------------------
+
 @torch.no_grad()
-def evaluate(model, test_loader, device):
+def evaluate(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+) -> Tuple[float, float]:
     model.to(device)
     model.eval()
-
     criterion = nn.CrossEntropyLoss()
 
     total_loss = 0.0
@@ -1196,165 +1318,108 @@ def evaluate(model, test_loader, device):
     total = 0
 
     for images, labels in test_loader:
-        images = images.to(device)
-        labels = labels.to(device)
-
+        images = images.to(device, non_blocking=device.type == "cuda")
+        labels = labels.to(device, non_blocking=device.type == "cuda")
         logits = model(images)
         loss = criterion(logits, labels)
-
         preds = torch.argmax(logits, dim=1)
 
         batch_size = images.size(0)
-
         total_loss += loss.item() * batch_size
         correct += (preds == labels).sum().item()
         total += batch_size
 
-    acc = correct / total * 100.0
-    avg_loss = total_loss / total
-
-    return acc, avg_loss
+    if total <= 0:
+        raise ValueError("测试 DataLoader 为空")
+    return correct / total * 100.0, total_loss / total
 
 
 # ------------------------------------------------------------
-# 16. 普通聚合权重
+# Aggregation
 # ------------------------------------------------------------
-def get_aggregation_weights(method, client_num_samples):
+
+def get_aggregation_weights(
+    method: str,
+    client_num_samples: Sequence[int],
+) -> np.ndarray:
     num_clients = len(client_num_samples)
+    if num_clients <= 0:
+        raise ValueError("客户端数量不能为空")
 
     if method == "uniform":
-        weights = np.ones(num_clients, dtype=np.float64) / num_clients
-
-    elif method == "sample_weighted":
-        client_num_samples = np.array(client_num_samples, dtype=np.float64)
-        weights = client_num_samples / client_num_samples.sum()
-
-    else:
-        raise ValueError(f"未知聚合方式: {method}")
-
-    return weights
+        return np.ones(num_clients, dtype=np.float64) / num_clients
+    if method == "sample_weighted":
+        sample_counts = np.asarray(client_num_samples, dtype=np.float64)
+        total = float(sample_counts.sum())
+        if total <= 0:
+            raise ValueError("client_num_samples 总和必须大于 0")
+        return sample_counts / total
+    raise ValueError(f"未知聚合方式: {method}")
 
 
 def get_expert_activation_count_weights(
-    client_expert_counts,
-    expert_id,
-    num_clients,
-):
+    client_expert_counts: Sequence[Sequence[float]],
+    expert_id: int,
+    num_clients: int,
+) -> np.ndarray:
     if client_expert_counts is None:
         raise ValueError(
             "expert_agg=expert_activation_count_weighted 时，"
             "必须传入 client_expert_counts。"
         )
 
-    count_values = np.array(
-        client_expert_counts,
-        dtype=np.float64,
-    )
-
+    count_values = np.asarray(client_expert_counts, dtype=np.float64)
     if count_values.ndim != 2:
         raise ValueError(
-            "client_expert_counts 应该是二维，"
-            f"shape=[num_clients, num_experts]，实际是 {count_values.shape}"
+            "client_expert_counts 应该是二维 "
+            "[num_clients, num_experts]"
         )
 
     input_num_clients, num_experts = count_values.shape
-
     if input_num_clients != num_clients:
-        raise ValueError(
-            f"client_expert_counts 的客户端数量不一致: "
-            f"count_clients={input_num_clients}, num_clients={num_clients}"
-        )
-
+        raise ValueError("client_expert_counts 的客户端数量不一致")
     if expert_id < 0 or expert_id >= num_experts:
-        raise ValueError(
-            f"expert_id 越界: expert_id={expert_id}, num_experts={num_experts}"
-        )
+        raise ValueError("expert_id 越界")
 
-    weights = count_values[:, expert_id].copy()
-    weights = np.maximum(weights, 0.0)
-
-    weight_sum = weights.sum()
-
-    if weight_sum <= 1e-12:
-        weights = np.ones(
-            num_clients,
-            dtype=np.float64,
-        ) / num_clients
-    else:
-        weights = weights / weight_sum
-
-    return weights
+    weights = np.maximum(count_values[:, expert_id], 0.0)
+    if weights.sum() <= 1e-12:
+        return np.ones(num_clients, dtype=np.float64) / num_clients
+    return weights / weights.sum()
 
 
-# ------------------------------------------------------------
-# 17. 普通聚合客户端参数
-# ------------------------------------------------------------
 def aggregate_state_dicts(
-    client_state_dicts,
-    client_num_samples,
-    cfg,
-    client_expert_counts=None,
-):
+    client_state_dicts: Sequence[Mapping[str, torch.Tensor]],
+    client_num_samples: Sequence[int],
+    cfg: Mapping,
+    client_expert_counts: Optional[Sequence[Sequence[float]]] = None,
+) -> Dict[str, torch.Tensor]:
     agg_cfg = cfg["aggregation"]
-
-    non_expert_method = agg_cfg["non_expert_agg"]
-    expert_method = agg_cfg["expert_agg"]
+    non_expert_method = str(agg_cfg["non_expert_agg"])
+    expert_method = str(agg_cfg["expert_agg"])
 
     if expert_method == "meta_network":
-        raise ValueError(
-            "expert_agg=meta_network 时不应该调用普通 aggregate_state_dicts"
-        )
+        raise ValueError("meta_network 不应调用 aggregate_state_dicts")
 
-    activation_count_methods = {
+    activation_methods = {
         "expert_activation_count_weighted",
         "activation_count_weighted",
     }
-
     num_clients = len(client_num_samples)
-
     non_expert_weights = get_aggregation_weights(
         non_expert_method,
         client_num_samples,
     )
 
-    if expert_method in activation_count_methods:
-        if client_expert_counts is None:
-            raise ValueError(
-                f"expert_agg={expert_method} 时，"
-                "aggregate_state_dicts 必须传入 client_expert_counts。"
-            )
-
-        count_values = np.array(
-            client_expert_counts,
-            dtype=np.float64,
-        )
-
-        if count_values.ndim != 2:
-            raise ValueError(
-                "client_expert_counts 应该是二维，"
-                f"shape=[num_clients, num_experts]，实际是 {count_values.shape}"
-            )
-
-        if count_values.shape[0] != num_clients:
-            raise ValueError(
-                f"client_expert_counts 客户端数量不一致: "
-                f"count_clients={count_values.shape[0]}, "
-                f"num_clients={num_clients}"
-            )
-
+    if expert_method in activation_methods:
         expert_weights = None
-
     else:
         expert_weights = get_aggregation_weights(
             expert_method,
             client_num_samples,
         )
 
-    new_state_dict = {}
-
-    state_keys = client_state_dicts[0].keys()
-
-    for name in state_keys:
+    new_state_dict: Dict[str, torch.Tensor] = {}
+    for name in client_state_dicts[0].keys():
         first_tensor = client_state_dicts[0][name]
 
         if not torch.is_floating_point(first_tensor):
@@ -1362,105 +1427,74 @@ def aggregate_state_dicts(
             continue
 
         if is_expert_param(name):
-            if expert_method in activation_count_methods:
+            if expert_method in activation_methods:
                 expert_id = get_expert_id_from_name(name)
-
                 if expert_id is None:
-                    raise ValueError(
-                        f"参数名包含 expert，但解析不出 expert_id: {name}"
-                    )
-
+                    raise ValueError(f"无法从参数名解析 expert id: {name}")
                 weights = get_expert_activation_count_weights(
                     client_expert_counts=client_expert_counts,
                     expert_id=expert_id,
                     num_clients=num_clients,
                 )
-
             else:
                 weights = expert_weights
-
         else:
             weights = non_expert_weights
 
-        aggregated_tensor = torch.zeros_like(first_tensor)
-
+        aggregated = torch.zeros_like(first_tensor)
         for client_id, client_state in enumerate(client_state_dicts):
-            aggregated_tensor += client_state[name] * float(weights[client_id])
-
-        new_state_dict[name] = aggregated_tensor
+            aggregated += client_state[name] * float(weights[client_id])
+        new_state_dict[name] = aggregated
 
     return new_state_dict
 
 
 # ------------------------------------------------------------
-# 18. 打印客户端划分信息
+# Display helpers
 # ------------------------------------------------------------
-def print_partition_summary(client_indices):
-    print("========== 客户端数据划分 ==========")
 
+def print_partition_summary(client_indices: Sequence[Sequence[int]]) -> None:
+    print("========== 客户端数据划分 ==========")
     for client_id, indices in enumerate(client_indices):
         print(f"client {client_id:02d}: {len(indices)} samples")
-
     print("===================================")
 
 
 # ------------------------------------------------------------
-# 19. 打印元网络输出 alpha
+# Main training loop
 # ------------------------------------------------------------
-def print_meta_alpha(alpha):
-    if alpha is None:
-        return
 
-    if isinstance(alpha, torch.Tensor):
-        alpha = alpha.detach().cpu()
-
-    print("========== Meta expert alpha ==========")
-
-    num_experts = alpha.shape[0]
-
-    for expert_id in range(num_experts):
-        weights = alpha[expert_id].tolist()
-        weights_str = ", ".join([f"{w:.3f}" for w in weights])
-        print(f"expert {expert_id}: [{weights_str}]")
-
-    print("=======================================")
-
-
-# ------------------------------------------------------------
-# 20. 主训练流程
-# ------------------------------------------------------------
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
         "--config",
         type=str,
         default="config.yaml",
         help="配置文件路径",
     )
-
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-
-    log_path = setup_logging(
-        cfg=cfg,
-        config_path=args.config,
-    )
-
+    log_path = setup_logging(cfg=cfg, config_path=args.config)
     print(f"配置文件路径: {args.config}")
 
-    seed = cfg.get("seed", 1)
-    set_seed(seed)
-
+    seed = int(cfg.get("seed", 1))
+    repro_cfg = get_reproducibility_cfg(cfg)
+    set_seed(seed, repro_cfg)
     print(f"随机种子: {seed}")
 
     device = get_device(cfg)
-
     print(f"使用设备: {device}")
 
-    train_set, test_set = build_datasets(cfg)
+    log_reproducibility_environment(
+        cfg=cfg,
+        config_path=args.config,
+        seed=seed,
+        device=device,
+        repro_cfg=repro_cfg,
+    )
 
+    train_set, test_set = build_datasets(cfg)
     train_set, train_labels = build_long_tail_train_set(
         train_set=train_set,
         cfg=cfg,
@@ -1474,92 +1508,112 @@ def main():
     )
 
     dataset_cfg = cfg["dataset"]
-
     client_indices = dirichlet_partition(
         labels=train_labels,
-        num_clients=dataset_cfg["num_clients"],
-        alpha=dataset_cfg["alpha"],
+        num_clients=int(dataset_cfg["num_clients"]),
+        alpha=float(dataset_cfg["alpha"]),
         seed=seed,
+        min_size=int(dataset_cfg.get("min_samples_per_client", 10)),
+        max_attempts=int(dataset_cfg.get("partition_max_attempts", 100)),
     )
-
     print_partition_summary(client_indices)
 
-    client_loaders = build_client_loaders(
+    client_datasets = build_client_datasets(
         train_set=train_set,
         client_indices=client_indices,
         cfg=cfg,
-        device=device,
         seed=seed,
     )
-
     server_val_loader = build_server_val_loader(
         server_val_set=server_val_set,
         cfg=cfg,
         device=device,
+        base_seed=seed,
+        repro_cfg=repro_cfg,
     )
-
     test_loader = build_test_loader(
         test_set=final_test_set,
         cfg=cfg,
         device=device,
+        base_seed=seed,
+        repro_cfg=repro_cfg,
     )
 
-    global_model = build_model(cfg)
+    # Model initialization is isolated from all loader and Meta RNG streams.
+    model_init_seed = stable_seed(
+        seed,
+        SEED_NAMESPACES["model_init"],
+    )
+    with isolated_rng(model_init_seed, device):
+        global_model = build_model(cfg)
     global_model.to(device)
-
     print_trainable_param_stats(global_model)
+
+    if bool(repro_cfg.get("log_initial_state_hash", True)):
+        log_only(
+            f"[REPRO] initial_model_seed={model_init_seed}"
+        )
+        log_only(
+            f"[REPRO] initial_model_state_hash="
+            f"{hash_state_dict(global_model.state_dict())}"
+        )
 
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
     agg_cfg = cfg["aggregation"]
 
-    num_clients = dataset_cfg["num_clients"]
-    rounds = train_cfg["rounds"]
-    clients_per_round = train_cfg["clients_per_round"]
-
+    num_clients = int(dataset_cfg["num_clients"])
+    rounds = int(train_cfg["rounds"])
+    clients_per_round = int(train_cfg["clients_per_round"])
     if clients_per_round > num_clients:
         raise ValueError("clients_per_round 不能大于 num_clients")
 
+    effective_num_workers = get_effective_num_workers(cfg, repro_cfg)
+    log_only(
+        f"[REPRO] requested_num_workers="
+        f"{int(train_cfg.get('num_workers', 2))}"
+    )
+    log_only(f"[REPRO] effective_num_workers={effective_num_workers}")
+
     best_acc = 0.0
+    expert_agg = str(agg_cfg["expert_agg"])
+    non_expert_agg = str(agg_cfg["non_expert_agg"])
 
-    expert_agg = agg_cfg["expert_agg"]
-    non_expert_agg = agg_cfg["non_expert_agg"]
-
-    meta_aggregator = None
-
+    meta_aggregator: Optional[MetaExpertAggregator] = None
     if expert_agg == "meta_network":
         if server_val_loader is None:
             raise ValueError("使用 meta_network 时，server.val_size 必须大于 0")
-
         meta_cfg = cfg.get("meta", {})
-
-        meta_aggregator = MetaExpertAggregator(
-            num_experts=model_cfg["num_experts"],
-            device=device,
-            hidden_dim=meta_cfg.get("hidden_dim", 32),
-            lr=meta_cfg.get("lr", 1e-3),
-            meta_steps=meta_cfg.get("steps", 1),
-            max_val_batches=meta_cfg.get("max_val_batches", 4),
-            train_log_path=log_path,
-            tau=meta_cfg.get("tau", 1.0),
-            active_mask=meta_cfg.get("active_mask", False),
-            active_threshold=meta_cfg.get("active_threshold", 0.0),
-            min_active_clients_per_expert=meta_cfg.get(
-                "min_active_clients_per_expert",
-                2,
-            ),
-            input_features=meta_cfg.get(
-                "input_features",
-                [
-                    "loss_z",
-                    "sample_ratio",
-                    "expert_freq",
-                ],
-            ),
+        meta_init_seed = stable_seed(
+            seed,
+            SEED_NAMESPACES["meta_init"],
         )
-
+        with isolated_rng(meta_init_seed, device):
+            meta_aggregator = MetaExpertAggregator(
+                num_experts=int(model_cfg["num_experts"]),
+                device=device,
+                hidden_dim=int(meta_cfg.get("hidden_dim", 32)),
+                lr=float(meta_cfg.get("lr", 1e-3)),
+                meta_steps=int(meta_cfg.get("steps", 1)),
+                max_val_batches=meta_cfg.get("max_val_batches", 4),
+                train_log_path=log_path,
+                tau=float(meta_cfg.get("tau", 1.0)),
+                active_mask=bool(meta_cfg.get("active_mask", False)),
+                active_threshold=float(meta_cfg.get("active_threshold", 0.0)),
+                min_active_clients_per_expert=int(
+                    meta_cfg.get("min_active_clients_per_expert", 2)
+                ),
+                input_features=meta_cfg.get(
+                    "input_features",
+                    ["loss_z", "sample_ratio", "expert_freq"],
+                ),
+            )
+        log_only(f"[REPRO] meta_init_seed={meta_init_seed}")
+        log_only(
+            f"[REPRO] meta_initial_state_hash="
+            f"{hash_state_dict(meta_aggregator.meta_net.state_dict())}"
+        )
         print("已启用 expert_agg = meta_network")
-
     else:
         print(f"使用普通 expert_agg = {expert_agg}")
 
@@ -1572,14 +1626,15 @@ def main():
     print(f"lr                  : {train_cfg['lr']}")
     print(f"momentum            : {train_cfg.get('momentum', 0.9)}")
     print(f"weight_decay        : {train_cfg.get('weight_decay', 0.0005)}")
-    print(f"router_balance_w    : {train_cfg.get('router_balance_weight', 0.0)}")
+    print(
+        f"router_balance_w    : "
+        f"{train_cfg.get('router_balance_weight', 0.0)}"
+    )
     print(f"model.top_k         : {model_cfg.get('top_k', 1)}")
     print(f"non_expert_agg      : {non_expert_agg}")
     print(f"expert_agg          : {expert_agg}")
-
-    if expert_agg == "meta_network":
+    if meta_aggregator is not None:
         meta_cfg = cfg.get("meta", {})
-
         print("---------- Meta 配置 ----------")
         print(f"meta.hidden_dim     : {meta_cfg.get('hidden_dim', 32)}")
         print(f"meta.lr             : {meta_cfg.get('lr', 1e-3)}")
@@ -1587,16 +1642,18 @@ def main():
         print(f"meta.tau            : {meta_cfg.get('tau', 1.0)}")
         print(f"max_val_batches     : {meta_cfg.get('max_val_batches', 4)}")
         print(f"meta.active_mask    : {meta_cfg.get('active_mask', False)}")
-        print(f"active_threshold    : {meta_cfg.get('active_threshold', 0.0)}")
+        print(
+            f"active_threshold    : "
+            f"{meta_cfg.get('active_threshold', 0.0)}"
+        )
         print(
             "min_active_clients : "
             f"{meta_cfg.get('min_active_clients_per_expert', 2)}"
         )
-
-        if meta_aggregator is not None:
-            input_features = ", ".join(meta_aggregator.input_feature_names)
-            print(f"meta.input_features : [{input_features}]")
-
+        print(
+            "meta.input_features : "
+            f"[{', '.join(meta_aggregator.input_feature_names)}]"
+        )
     print("==============================")
 
     for round_id in range(1, rounds + 1):
@@ -1605,6 +1662,8 @@ def main():
             for name, tensor in global_model.state_dict().items()
         }
 
+        # Preserve the original commit's client-selection behavior. With the
+        # normal 10/10 configuration, every client participates each round.
         selected_clients = list(range(clients_per_round))
 
         client_state_dicts = []
@@ -1615,6 +1674,19 @@ def main():
         client_expert_losses = []
 
         for client_id in selected_clients:
+            # Rebuild the loader for each round/client so its permutation is a
+            # pure function of (base_seed, round_id, client_id), independent of
+            # Meta initialization and all other RNG consumption.
+            client_loader = build_client_loader_for_round(
+                client_dataset=client_datasets[client_id],
+                cfg=cfg,
+                device=device,
+                base_seed=seed,
+                round_id=round_id,
+                client_id=client_id,
+                repro_cfg=repro_cfg,
+            )
+
             (
                 local_state_dict,
                 num_samples,
@@ -1624,10 +1696,39 @@ def main():
                 expert_loss,
             ) = local_train(
                 global_state_dict=global_state_dict,
-                train_loader=client_loaders[client_id],
+                train_loader=client_loader,
                 cfg=cfg,
                 device=device,
+                base_seed=seed,
+                round_id=round_id,
+                client_id=client_id,
             )
+
+            if (
+                round_id == 1
+                and bool(
+                    repro_cfg.get("log_first_round_client_hashes", True)
+                )
+            ):
+                loader_seed = stable_seed(
+                    seed,
+                    SEED_NAMESPACES["client_loader"],
+                    round_id,
+                    client_id,
+                )
+                local_seed = stable_seed(
+                    seed,
+                    SEED_NAMESPACES["local_train"],
+                    round_id,
+                    client_id,
+                )
+                log_only(
+                    f"[REPRO_CLIENT] round={round_id} client={client_id} "
+                    f"loader_seed={loader_seed} local_seed={local_seed} "
+                    f"loss={avg_loss:.12f} "
+                    f"expert_counts={expert_count_values} "
+                    f"state_hash={hash_state_dict(local_state_dict)}"
+                )
 
             client_state_dicts.append(local_state_dict)
             client_num_samples.append(num_samples)
@@ -1637,20 +1738,29 @@ def main():
             client_expert_losses.append(expert_loss)
 
         meta_info = None
-
         if expert_agg == "meta_network":
-            new_global_state_dict, meta_info = meta_aggregator.aggregate(
-                model=global_model,
-                client_state_dicts=client_state_dicts,
-                client_num_samples=client_num_samples,
-                client_losses=client_losses,
-                client_expert_freqs=client_expert_freqs,
-                client_expert_counts=client_expert_counts,
-                client_expert_losses=client_expert_losses,
-                val_loader=server_val_loader,
-                non_expert_agg=non_expert_agg,
+            if meta_aggregator is None:
+                raise RuntimeError("meta_aggregator 未初始化")
+            meta_round_seed = stable_seed(
+                seed,
+                SEED_NAMESPACES["meta_round"],
+                round_id,
             )
-
+            with isolated_rng(meta_round_seed, device):
+                new_global_state_dict, meta_info = meta_aggregator.aggregate(
+                    model=global_model,
+                    client_state_dicts=client_state_dicts,
+                    client_num_samples=client_num_samples,
+                    client_losses=client_losses,
+                    client_expert_freqs=client_expert_freqs,
+                    client_expert_counts=client_expert_counts,
+                    client_expert_losses=client_expert_losses,
+                    val_loader=server_val_loader,
+                    non_expert_agg=non_expert_agg,
+                )
+            log_only(
+                f"[REPRO_META] round={round_id} seed={meta_round_seed}"
+            )
         else:
             new_global_state_dict = aggregate_state_dicts(
                 client_state_dicts=client_state_dicts,
@@ -1659,37 +1769,44 @@ def main():
                 client_expert_counts=client_expert_counts,
             )
 
-        global_model.load_state_dict(new_global_state_dict)
+        if bool(
+            repro_cfg.get("log_global_state_hash_each_round", True)
+        ):
+            log_only(
+                f"[REPRO_GLOBAL] round={round_id} "
+                f"state_hash={hash_state_dict(new_global_state_dict)}"
+            )
 
-        test_acc, test_loss = evaluate(
-            model=global_model,
-            test_loader=test_loader,
-            device=device,
+        global_model.load_state_dict(new_global_state_dict, strict=True)
+        evaluation_seed = stable_seed(
+            seed,
+            SEED_NAMESPACES["evaluation"],
+            round_id,
         )
-
+        with isolated_rng(evaluation_seed, device):
+            test_acc, test_loss = evaluate(
+                model=global_model,
+                test_loader=test_loader,
+                device=device,
+            )
         best_acc = max(best_acc, test_acc)
-
         avg_client_loss = float(np.mean(client_losses))
 
         if meta_info is not None:
-            meta_loss = meta_info.get("meta_loss", None)
-
+            meta_loss = float(meta_info.get("meta_loss"))
             print(
                 f"Round {round_id:03d} | "
                 f"client_loss={avg_client_loss:.4f} | "
                 f"meta_loss={meta_loss:.4f} | "
                 f"test_loss={test_loss:.4f} | "
-                f"acc={test_acc:.2f}% | "
-                f"best={best_acc:.2f}%"
+                f"acc={test_acc:.2f}% | best={best_acc:.2f}%"
             )
-
         else:
             print(
                 f"Round {round_id:03d} | "
                 f"client_loss={avg_client_loss:.4f} | "
                 f"test_loss={test_loss:.4f} | "
-                f"acc={test_acc:.2f}% | "
-                f"best={best_acc:.2f}%"
+                f"acc={test_acc:.2f}% | best={best_acc:.2f}%"
             )
 
     print("=" * 80)
@@ -1698,8 +1815,5 @@ def main():
     print("=" * 80)
 
 
-# ------------------------------------------------------------
-# 21. 程序入口
-# ------------------------------------------------------------
 if __name__ == "__main__":
     main()

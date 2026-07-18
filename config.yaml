@@ -68,3 +68,21 @@ aggregation:
 
   # expert_agg 支持：uniform / sample_weighted / meta_network / expert_activation_count_weighted
   expert_agg: meta_network
+
+reproducibility:
+  enabled: true
+
+  # 遇到非确定性 CUDA 算子时直接报错，而不是静默继续
+  strict_determinism: true
+
+  # 严格复现实验阶段固定为单进程数据加载
+  force_num_workers_zero: true
+
+  # 禁止不同 GPU 上可能采用的 TF32 数值路径
+  disable_tf32: true
+
+  # 以下诊断只写入日志，不打印到控制台
+  log_environment: true
+  log_initial_state_hash: true
+  log_first_round_client_hashes: true
+  log_global_state_hash_each_round: true
