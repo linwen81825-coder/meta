@@ -61,6 +61,20 @@ meta:
   active_mask: true
   active_threshold: 0.0
   min_active_clients_per_expert: 2
+   # 每个客户端在本地训练前随机前向多少个batch。
+  pre_probe_batches: 4
+  # 训练前probe的batch size。
+  # probe loader与本地训练loader相互独立。
+  pre_probe_batch_size: 64
+  # true：
+  # 元网络更新后的第二次输入，仍使用训练前probe的
+  # loss和专家激活比例。
+  #
+  # false：
+  # 元网络更新后的第二次输入，改用本地训练过程中统计的
+  # 平均loss和专家激活比例。
+  second_input_same_as_first: false
+
   
 aggregation:
   # non_expert_agg 支持：uniform / sample_weighted
