@@ -4003,6 +4003,55 @@ def main() -> None:
                             1.0,
                         )
                     ),
+
+                    tau_schedule=str(
+                        meta_cfg.get(
+                            "tau_schedule",
+                            "constant",
+                        )
+                    ),
+
+                    tau_start=float(
+                        meta_cfg.get(
+                            "tau_start",
+                            meta_cfg.get(
+                                "tau",
+                                1.0,
+                            ),
+                        )
+                    ),
+
+                    tau_end=float(
+                        meta_cfg.get(
+                            "tau_end",
+                            meta_cfg.get(
+                                "tau_start",
+                                meta_cfg.get(
+                                    "tau",
+                                    1.0,
+                                ),
+                            ),
+                        )
+                    ),
+
+                    tau_anneal_rounds=(
+                        None
+                        if meta_cfg.get(
+                            "tau_anneal_rounds"
+                        ) is None
+                        else int(
+                            meta_cfg[
+                                "tau_anneal_rounds"
+                            ]
+                        )
+                    ),
+
+                    total_rounds=int(
+                        train_cfg.get(
+                            "rounds",
+                            1,
+                        )
+                    ),
                     active_mask=bool(
                         meta_cfg.get(
                             "active_mask",
@@ -4122,9 +4171,41 @@ def main() -> None:
             f"meta.steps          : "
             f"{meta_cfg.get('steps', 1)}"
         )
+        resolved_tau_anneal_rounds = (
+            int(
+                train_cfg.get(
+                    "rounds",
+                    1,
+                )
+            )
+            if meta_cfg.get(
+                "tau_anneal_rounds"
+            ) is None
+            else int(
+                meta_cfg[
+                    "tau_anneal_rounds"
+                ]
+            )
+        )
+
         print(
-            f"meta.tau            : "
-            f"{meta_cfg.get('tau', 1.0)}"
+            f"meta.tau_schedule    : "
+            f"{meta_cfg.get('tau_schedule', 'constant')}"
+        )
+
+        print(
+            f"meta.tau_start       : "
+            f"{meta_cfg.get('tau_start', meta_cfg.get('tau', 1.0))}"
+        )
+
+        print(
+            f"meta.tau_end         : "
+            f"{meta_cfg.get('tau_end', meta_cfg.get('tau_start', meta_cfg.get('tau', 1.0)))}"
+        )
+
+        print(
+            f"meta.tau_anneal_rounds: "
+            f"{resolved_tau_anneal_rounds}"
         )
         print(
             f"max_val_batches     : "

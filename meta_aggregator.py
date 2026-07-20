@@ -107,7 +107,8 @@ def counts_to_frequency(
     """
     将客户端内部的专家激活次数转换为比例。
 
-    分母使用全部专家的激活次数之和，因此同时适用于Top-1和Top-K。
+    分母使用全部专家的激活次数之和，
+    因此同时适用于 Top-1 和 Top-K。
     """
     total = expert_counts.sum().item()
 
@@ -124,9 +125,7 @@ def counts_to_frequency(
 
 
 class MetaWeightNet(nn.Module):
-    """
-    对每个“专家-客户端”组合计算聚合分数。
-    """
+    """对每个“专家-客户端”组合计算聚合分数。"""
 
     def __init__(
         self,
@@ -246,7 +245,13 @@ class MetaWeightNet(nn.Module):
 
 class MetaExpertAggregator:
     """
-    每轮只更新一次元网络，然后重新计算最终专家聚合权重。
+    每轮只更新一次元网络，
+    然后重新计算最终专家聚合权重。
+
+    温度退火规则：
+    1. 每个联邦轮次开始时计算一次 current_tau；
+    2. 同一轮 alpha_before 和 alpha_final 使用相同温度；
+    3. 温度不会在同一次元更新前后变化。
     """
 
     ALLOWED_FEATURES = {
@@ -258,6 +263,12 @@ class MetaExpertAggregator:
         "expert_loss_z",
         "expert_loss_raw",
         "delta_norm_z",
+    }
+
+    ALLOWED_TAU_SCHEDULES = {
+        "constant",
+        "linear",
+        "exponential",
     }
 
     def __init__(
@@ -274,6 +285,11 @@ class MetaExpertAggregator:
             Sequence[str]
         ] = None,
         tau: float = 1.0,
+        tau_schedule: str = "constant",
+        tau_start: Optional[float] = None,
+        tau_end: Optional[float] = None,
+        tau_anneal_rounds: Optional[int] = None,
+        total_rounds: Optional[int] = None,
         active_mask: bool = False,
         active_threshold: float = 0.0,
         min_active_clients_per_expert: int = 2,
@@ -291,7 +307,8 @@ class MetaExpertAggregator:
         if int(meta_steps) != 1:
             raise ValueError(
                 "当前 full-validation 更新模式要求 "
-                "meta.steps: 1；每个联邦轮次只更新一次元网络。"
+                "meta.steps: 1；"
+                "每个联邦轮次只更新一次元网络。"
             )
 
         if (
@@ -299,12 +316,14 @@ class MetaExpertAggregator:
             and int(max_val_batches) <= 0
         ):
             raise ValueError(
-                "meta.max_val_batches 必须为 null 或正整数"
+                "meta.max_val_batches "
+                "必须为 null 或正整数"
             )
 
         if min_active_clients_per_expert < 1:
             raise ValueError(
-                "min_active_clients_per_expert 必须 >= 1"
+                "min_active_clients_per_expert "
+                "必须 >= 1"
             )
 
         if (
@@ -330,9 +349,7 @@ class MetaExpertAggregator:
                 "meta.input_features 必须是 list"
             )
 
-        input_features = list(
-            input_features
-        )
+        input_features = list(input_features)
 
         if not input_features:
             raise ValueError(
@@ -351,10 +368,7 @@ class MetaExpertAggregator:
                 f"支持: {sorted(self.ALLOWED_FEATURES)}"
             )
 
-        self.num_experts = int(
-            num_experts
-        )
-
+        self.num_experts = int(num_experts)
         self.device = device
         self.meta_steps = 1
 
@@ -364,25 +378,93 @@ class MetaExpertAggregator:
             else int(max_val_batches)
         )
 
+        # 旧版固定温度参数。
+        # 保留它是为了兼容旧配置。
         self.tau = float(tau)
-        self.active_mask = bool(active_mask)
 
+        # ----------------------------------------------------
+        # 温度退火配置
+        # ----------------------------------------------------
+        self.tau_schedule = (
+            str(tau_schedule)
+            .strip()
+            .lower()
+        )
+
+        if (
+            self.tau_schedule
+            not in self.ALLOWED_TAU_SCHEDULES
+        ):
+            raise ValueError(
+                "meta.tau_schedule 仅支持 "
+                "constant / linear / exponential"
+            )
+
+        self.tau_start = float(
+            self.tau
+            if tau_start is None
+            else tau_start
+        )
+
+        self.tau_end = float(
+            self.tau_start
+            if tau_end is None
+            else tau_end
+        )
+
+        if (
+            self.tau_start <= 0
+            or self.tau_end <= 0
+        ):
+            raise ValueError(
+                "meta.tau_start 和 "
+                "meta.tau_end 必须大于 0"
+            )
+
+        self.total_rounds = (
+            None
+            if total_rounds is None
+            else int(total_rounds)
+        )
+
+        if (
+            self.total_rounds is not None
+            and self.total_rounds < 1
+        ):
+            raise ValueError(
+                "total_rounds 必须为正整数"
+            )
+
+        # tau_anneal_rounds=null 时，
+        # 自动使用 train.rounds。
+        self.tau_anneal_rounds = (
+            self.total_rounds
+            if tau_anneal_rounds is None
+            else int(tau_anneal_rounds)
+        )
+
+        if self.tau_anneal_rounds is None:
+            self.tau_anneal_rounds = 1
+
+        if self.tau_anneal_rounds < 1:
+            raise ValueError(
+                "meta.tau_anneal_rounds "
+                "必须为 null 或正整数"
+            )
+
+        # 在第一轮 aggregate() 开始时会更新。
+        self.current_tau = self.tau_start
+
+        self.active_mask = bool(active_mask)
         self.active_threshold = float(
             active_threshold
         )
-
         self.min_active_clients_per_expert = int(
             min_active_clients_per_expert
         )
 
-        self.input_feature_names = (
-            input_features
-        )
-
-        self.train_log_path = (
-            train_log_path
-        )
-
+        self.input_feature_names = input_features
+        self.train_log_path = train_log_path
         self.log_fn = log_fn
         self.round_id = 0
 
@@ -396,6 +478,81 @@ class MetaExpertAggregator:
         self.optimizer = torch.optim.Adam(
             self.meta_net.parameters(),
             lr=float(lr),
+        )
+
+    def _tau_progress(
+        self,
+        round_id: Optional[int] = None,
+    ) -> float:
+        """
+        返回当前轮次的退火进度。
+
+        第1轮进度为0；
+        最后一个退火轮次进度为1；
+        超出退火轮数后保持1。
+        """
+        current_round = (
+            self.round_id
+            if round_id is None
+            else int(round_id)
+        )
+
+        if self.tau_anneal_rounds <= 1:
+            return 1.0
+
+        progress = (
+            float(current_round - 1)
+            / float(
+                self.tau_anneal_rounds - 1
+            )
+        )
+
+        return min(
+            1.0,
+            max(
+                0.0,
+                progress,
+            ),
+        )
+
+    def scheduled_tau(
+        self,
+        round_id: Optional[int] = None,
+    ) -> float:
+        """根据联邦轮次计算当轮温度。"""
+        progress = self._tau_progress(
+            round_id
+        )
+
+        if self.tau_schedule == "constant":
+            return self.tau_start
+
+        if self.tau_schedule == "linear":
+            return (
+                self.tau_start
+                + (
+                    self.tau_end
+                    - self.tau_start
+                )
+                * progress
+            )
+
+        # 指数退火：
+        #
+        # tau_r =
+        # tau_start *
+        # (tau_end / tau_start) ^ progress
+        #
+        # 第1轮严格等于 tau_start；
+        # 最后一个退火轮次严格等于 tau_end。
+        ratio = (
+            self.tau_end
+            / self.tau_start
+        )
+
+        return (
+            self.tau_start
+            * (ratio ** progress)
         )
 
     def _write_log(
@@ -469,7 +626,8 @@ class MetaExpertAggregator:
                     )
 
                 self._write_log(
-                    f"[META_INPUT_{stage.upper()}] "
+                    f"[META_INPUT_"
+                    f"{stage.upper()}] "
                     f"round={self.round_id} "
                     f"expert={expert_id} "
                     f"client={client_id} "
@@ -482,7 +640,9 @@ class MetaExpertAggregator:
         alpha: torch.Tensor,
     ) -> None:
         alpha_cpu = (
-            alpha.detach().cpu()
+            alpha
+            .detach()
+            .cpu()
         )
 
         for expert_id in range(
@@ -495,7 +655,8 @@ class MetaExpertAggregator:
             )
 
             self._write_log(
-                f"[META_ALPHA_{stage.upper()}] "
+                f"[META_ALPHA_"
+                f"{stage.upper()}] "
                 f"round={self.round_id} "
                 f"expert={expert_id} "
                 f"alpha=[{values}]"
@@ -529,7 +690,8 @@ class MetaExpertAggregator:
         if tensor.numel() != num_clients:
             raise ValueError(
                 f"{name} 数量不一致: "
-                f"{tensor.numel()} != {num_clients}"
+                f"{tensor.numel()} "
+                f"!= {num_clients}"
             )
 
         return tensor
@@ -560,11 +722,13 @@ class MetaExpertAggregator:
 
         if (
             tensor.dim() != 2
-            or tuple(tensor.shape) != expected
+            or tuple(tensor.shape)
+            != expected
         ):
             raise ValueError(
                 f"{name} shape 不一致: "
-                f"{tuple(tensor.shape)} != {expected}"
+                f"{tuple(tensor.shape)} "
+                f"!= {expected}"
             )
 
         return tensor
@@ -596,8 +760,9 @@ class MetaExpertAggregator:
                 in global_state_dict.keys()
                 if (
                     is_expert_param(name)
-                    and get_expert_id_from_name(name)
-                    == expert_id
+                    and get_expert_id_from_name(
+                        name
+                    ) == expert_id
                     and torch.is_floating_point(
                         global_state_dict[name]
                     )
@@ -636,7 +801,9 @@ class MetaExpertAggregator:
                     expert_id,
                     client_id,
                 ] = torch.sqrt(
-                    squared_sum.clamp_min(0.0)
+                    squared_sum.clamp_min(
+                        0.0
+                    )
                 )
 
         mean = norms.mean(
@@ -711,7 +878,8 @@ class MetaExpertAggregator:
         )
 
         loss_raw = (
-            losses.unsqueeze(0)
+            losses
+            .unsqueeze(0)
             .expand(
                 self.num_experts,
                 num_clients,
@@ -728,9 +896,8 @@ class MetaExpertAggregator:
 
         sample_ratio = (
             sample_counts
-            / sample_counts.sum().clamp_min(
-                1e-6
-            )
+            / sample_counts.sum()
+            .clamp_min(1e-6)
         ).unsqueeze(0).expand(
             self.num_experts,
             num_clients,
@@ -754,9 +921,11 @@ class MetaExpertAggregator:
             .transpose(0, 1)
         )
 
-        count_denom = expert_counts.sum(
-            dim=1,
-            keepdim=True,
+        count_denom = (
+            expert_counts.sum(
+                dim=1,
+                keepdim=True,
+            )
         )
 
         uniform = torch.full_like(
@@ -764,11 +933,17 @@ class MetaExpertAggregator:
             1.0 / num_clients,
         )
 
-        expert_count_ratio = torch.where(
-            count_denom > 1e-12,
-            expert_counts
-            / count_denom.clamp_min(1e-12),
-            uniform,
+        expert_count_ratio = (
+            torch.where(
+                count_denom > 1e-12,
+                (
+                    expert_counts
+                    / count_denom.clamp_min(
+                        1e-12
+                    )
+                ),
+                uniform,
+            )
         )
 
         expert_loss_raw = (
@@ -797,9 +972,12 @@ class MetaExpertAggregator:
         )
 
         expert_loss_z = (
-            expert_loss_raw
-            - expert_loss_mean
-        ) / expert_loss_std
+            (
+                expert_loss_raw
+                - expert_loss_mean
+            )
+            / expert_loss_std
+        )
 
         delta_norm_z = (
             self.build_delta_norm_z_feature(
@@ -840,7 +1018,10 @@ class MetaExpertAggregator:
             dim=-1,
         )
 
-        return features, feature_values
+        return (
+            features,
+            feature_values,
+        )
 
     def compute_alpha_from_features(
         self,
@@ -849,9 +1030,15 @@ class MetaExpertAggregator:
             Sequence[float]
         ],
     ) -> torch.Tensor:
+        # 这里使用的是当前联邦轮次固定的温度。
+        #
+        # 不再使用固定 self.tau：
+        # scores = self.meta_net(features) / self.tau
+        #
+        # 修改为：
         scores = (
             self.meta_net(features)
-            / self.tau
+            / self.current_tau
         )
 
         if not self.active_mask:
@@ -891,9 +1078,7 @@ class MetaExpertAggregator:
                 active_count
                 < self.min_active_clients_per_expert
             ):
-                safe_mask[
-                    expert_id
-                ] = True
+                safe_mask[expert_id] = True
 
         masked_scores = scores.masked_fill(
             ~safe_mask,
@@ -932,8 +1117,8 @@ class MetaExpertAggregator:
         if tuple(alpha.shape) != expected_shape:
             raise ValueError(
                 f"alpha shape 不一致: "
-                f"{tuple(alpha.shape)} != "
-                f"{expected_shape}"
+                f"{tuple(alpha.shape)} "
+                f"!= {expected_shape}"
             )
 
         non_expert_weights = (
@@ -951,15 +1136,17 @@ class MetaExpertAggregator:
         for name in (
             client_state_dicts[0].keys()
         ):
-            first = client_state_dicts[
-                0
-            ][name]
+            first = (
+                client_state_dicts[0][name]
+            )
 
             if not torch.is_floating_point(
                 first
             ):
                 new_state[name] = (
-                    first.to(device).clone()
+                    first
+                    .to(device)
+                    .clone()
                 )
                 continue
 
@@ -972,8 +1159,8 @@ class MetaExpertAggregator:
 
                 if expert_id is None:
                     raise ValueError(
-                        "无法从参数名解析 expert id: "
-                        f"{name}"
+                        "无法从参数名解析 "
+                        f"expert id: {name}"
                     )
 
                 aggregated = torch.zeros_like(
@@ -993,9 +1180,8 @@ class MetaExpertAggregator:
                             expert_id,
                             client_id,
                         ]
-                        * client_state[name].to(
-                            device
-                        )
+                        * client_state[name]
+                        .to(device)
                     )
 
             else:
@@ -1017,9 +1203,8 @@ class MetaExpertAggregator:
                                 client_id
                             ]
                         )
-                        * client_state[name].to(
-                            device
-                        )
+                        * client_state[name]
+                        .to(device)
                     )
 
             new_state[name] = aggregated
@@ -1040,10 +1225,14 @@ class MetaExpertAggregator:
         int,
     ]:
         """
-        先计算全部被选中的验证batch loss，再直接求batch均值。
+        先计算全部被选中的验证batch loss，
+        再直接求batch均值。
 
-        当val_size=1000且val_batch_size=250时：
-        Meta loss = 四个等大小batch loss的算术平均。
+        当 val_size=1000 且
+        val_batch_size=250 时：
+
+        Meta loss =
+        四个等大小batch loss的算术平均。
         """
         if val_loader is None:
             raise ValueError(
@@ -1077,14 +1266,16 @@ class MetaExpertAggregator:
             images = images.to(
                 self.device,
                 non_blocking=(
-                    self.device.type == "cuda"
+                    self.device.type
+                    == "cuda"
                 ),
             )
 
             labels = labels.to(
                 self.device,
                 non_blocking=(
-                    self.device.type == "cuda"
+                    self.device.type
+                    == "cuda"
                 ),
             )
 
@@ -1149,14 +1340,45 @@ class MetaExpertAggregator:
             Sequence[float]
         ],
         val_loader: Iterable,
-        non_expert_agg: str = "sample_weighted",
+        non_expert_agg: str = (
+            "sample_weighted"
+        ),
         second_input_same_as_first: bool = True,
     ) -> Tuple[
         Dict[str, torch.Tensor],
         Dict[str, object],
     ]:
         model.to(self.device)
+
         self.round_id += 1
+
+        # ----------------------------------------------------
+        # 每个联邦轮次只计算一次温度。
+        #
+        # alpha_before 和 alpha_final 都会读取
+        # self.current_tau，因此同一轮不会发生温度错位。
+        # ----------------------------------------------------
+        self.current_tau = (
+            self.scheduled_tau(
+                self.round_id
+            )
+        )
+
+        tau_progress = (
+            self._tau_progress(
+                self.round_id
+            )
+        )
+
+        self._write_log(
+            f"[META_TAU] "
+            f"round={self.round_id} "
+            f"schedule={self.tau_schedule} "
+            f"tau={self.current_tau:.10f} "
+            f"progress={tau_progress:.6f} "
+            f"anneal_rounds="
+            f"{self.tau_anneal_rounds}"
+        )
 
         global_state = {
             name: (
@@ -1165,8 +1387,10 @@ class MetaExpertAggregator:
                 .cpu()
                 .clone()
             )
-            for name, tensor
-            in model.state_dict().items()
+            for (
+                name,
+                tensor,
+            ) in model.state_dict().items()
         }
 
         # 第一次输入始终使用训练前probe统计。
@@ -1174,7 +1398,9 @@ class MetaExpertAggregator:
             first_features,
             first_values,
         ) = self.build_meta_features(
-            client_losses=pre_client_losses,
+            client_losses=(
+                pre_client_losses
+            ),
             client_expert_freqs=(
                 pre_client_expert_freqs
             ),
@@ -1241,12 +1467,15 @@ class MetaExpertAggregator:
             val_samples,
         ) = self.compute_validation_loss(
             model=model,
-            temp_state_dict=temporary_state,
+            temp_state_dict=(
+                temporary_state
+            ),
             val_loader=val_loader,
         )
 
         # 完整Meta验证loss只进行一次反向和一次更新。
         meta_loss.backward()
+
         self.optimizer.step()
 
         self._write_log(
@@ -1266,8 +1495,10 @@ class MetaExpertAggregator:
 
             final_values = {
                 name: value.detach()
-                for name, value
-                in first_values.items()
+                for (
+                    name,
+                    value,
+                ) in first_values.items()
             }
 
             final_freqs = (
@@ -1283,7 +1514,9 @@ class MetaExpertAggregator:
                 final_features,
                 final_values,
             ) = self.build_meta_features(
-                client_losses=client_losses,
+                client_losses=(
+                    client_losses
+                ),
                 client_expert_freqs=(
                     client_expert_freqs
                 ),
@@ -1310,8 +1543,10 @@ class MetaExpertAggregator:
 
             final_values = {
                 name: value.detach()
-                for name, value
-                in final_values.items()
+                for (
+                    name,
+                    value,
+                ) in final_values.items()
             }
 
             final_freqs = (
@@ -1335,10 +1570,13 @@ class MetaExpertAggregator:
         )
 
         # 元网络已更新，必须重新前向计算最终alpha。
+        # 此时仍使用本轮固定的 current_tau。
         with torch.no_grad():
             alpha_final = (
                 self.compute_alpha_from_features(
-                    features=final_features,
+                    features=(
+                        final_features
+                    ),
                     client_expert_freqs=(
                         final_freqs
                     ),
@@ -1387,8 +1625,10 @@ class MetaExpertAggregator:
                 .cpu()
                 .clone()
             )
-            for name, tensor
-            in final_state_device.items()
+            for (
+                name,
+                tensor,
+            ) in final_state_device.items()
         }
 
         return (
@@ -1422,6 +1662,17 @@ class MetaExpertAggregator:
                 "optimizer_steps": 1,
                 "second_input_mode": (
                     final_mode
+                ),
+
+                # 新增温度诊断信息。
+                "tau": float(
+                    self.current_tau
+                ),
+                "tau_progress": float(
+                    tau_progress
+                ),
+                "tau_schedule": (
+                    self.tau_schedule
                 ),
             },
         )

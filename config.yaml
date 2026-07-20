@@ -49,6 +49,19 @@ meta:
   steps: 1
   max_val_batches: 4
   tau: 0.5
+  # 可选：
+  # constant    固定温度
+  # linear      线性退火
+  # exponential 指数退火
+  tau_schedule: exponential
+  # 第1轮使用的温度。
+  tau_start: 1.0
+  # 最后一个退火轮次使用的温度。
+  tau_end: 0.3
+  # null 表示自动使用 train.rounds。
+  # 例如 train.rounds=50，则第1轮为1.0，第50轮为0.3。
+  # 如果设为30，则第30轮下降到0.3，第31轮以后保持0.3。
+  tau_anneal_rounds: null
   input_features:
     - loss_z
     - sample_ratio
