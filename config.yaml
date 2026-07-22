@@ -3,12 +3,12 @@ device: cuda
 
 dataset:
   name: cifar10
-  data_root: ./data
+  data_root: ./save/66
   num_classes: 10
   num_clients: 10
   alpha: 0.1
   long_tail:
-    enabled: true
+    enabled: false
     mode: geometric
     decay_factor: 0.9
     class_order: natural
@@ -16,10 +16,26 @@ dataset:
     min_samples_per_class: 1
     max_samples_per_class: null
   label_noise:
+  label_noise:
     enabled: true
     mode: symmetric
+    # constant：
+    # 所有客户端都使用 noise_rate
+    # auto：
+    # 自动为不同客户端生成不同噪声率
+    rate_mode: auto
+    # rate_mode=constant 时使用
     noise_rate: 0.2
+    # rate_mode=auto 时使用
+    auto:
+      # 推荐 linspace_shuffle
+      distribution: linspace_shuffle
+      # 自动生成的最小、最大噪声率
+      min_rate: 0.0
+      max_rate: 0.6
+      rate_seed: 2026
     seed_offset: 10000
+    # 保留手动覆盖能力。
     client_noise_rates: null
 
 model:

@@ -1500,32 +1500,252 @@ def get_dataset_label(
     return int(label)
 
 
-def get_client_noise_rate(
+def validate_client_noise_rates(
+    rates: Sequence[float],
+) -> None:
+    """
+    检查每个客户端的目标标签噪声率是否合法。
+    """
+    for client_id, rate in enumerate(
+        rates
+    ):
+        rate = float(rate)
+
+        if not (
+            0.0 <= rate <= 1.0
+        ):
+            raise ValueError(
+                f"client {client_id} 的 noise rate "
+                f"必须位于 [0, 1]，当前为 {rate}"
+            )
+
+
+def resolve_client_noise_rates(
     label_noise_cfg: Mapping,
-    client_id: int,
+    num_clients: int,
     default_noise_rate: float,
-) -> float:
-    rates = label_noise_cfg.get(
+) -> List[float]:
+    """
+    解析每个客户端使用的目标标签噪声率。
+
+    优先级：
+    1. client_noise_rates 非 null：使用手动列表；
+    2. rate_mode=constant：所有客户端使用 noise_rate；
+    3. rate_mode=auto：按配置自动生成异构噪声率。
+
+    自动模式支持：
+    - linspace_shuffle：在 [min_rate, max_rate] 内等间隔生成，
+      再使用 rate_seed 确定性打乱；
+    - uniform：在 [min_rate, max_rate] 内独立均匀采样。
+    """
+    num_clients = int(
+        num_clients
+    )
+
+    if num_clients <= 0:
+        raise ValueError(
+            "num_clients 必须大于 0"
+        )
+
+    manual_rates = label_noise_cfg.get(
         "client_noise_rates",
         None,
     )
 
-    if rates is None:
-        return float(
-            default_noise_rate
+    # 手动列表优先，兼容原有配置。
+    if manual_rates is not None:
+        if not isinstance(
+            manual_rates,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "client_noise_rates 必须是 list、tuple 或 null"
+            )
+
+        rates = [
+            float(rate)
+            for rate in manual_rates
+        ]
+
+        if len(rates) != num_clients:
+            raise ValueError(
+                "client_noise_rates 长度必须等于 "
+                f"num_clients={num_clients}，"
+                f"当前长度={len(rates)}"
+            )
+
+        validate_client_noise_rates(
+            rates
         )
+
+        return rates
+
+    rate_mode = str(
+        label_noise_cfg.get(
+            "rate_mode",
+            "constant",
+        )
+    ).lower()
+
+    # 默认保持原行为：所有客户端使用同一个 noise_rate。
+    if rate_mode == "constant":
+        rates = [
+            float(default_noise_rate)
+            for _ in range(
+                num_clients
+            )
+        ]
+
+        validate_client_noise_rates(
+            rates
+        )
+
+        return rates
+
+    if rate_mode != "auto":
+        raise ValueError(
+            "label_noise.rate_mode 仅支持 "
+            "constant / auto"
+        )
+
+    auto_cfg = label_noise_cfg.get(
+        "auto",
+        {},
+    )
+
+    if auto_cfg is None:
+        auto_cfg = {}
 
     if not isinstance(
-        rates,
-        (list, tuple),
+        auto_cfg,
+        Mapping,
     ):
         raise TypeError(
-            "client_noise_rates 必须是 list"
+            "label_noise.auto 必须是 YAML mapping"
         )
 
-    if client_id >= len(rates):
+    distribution = str(
+        auto_cfg.get(
+            "distribution",
+            "linspace_shuffle",
+        )
+    ).lower()
+
+    min_rate = float(
+        auto_cfg.get(
+            "min_rate",
+            0.0,
+        )
+    )
+
+    max_rate = float(
+        auto_cfg.get(
+            "max_rate",
+            default_noise_rate,
+        )
+    )
+
+    rate_seed = int(
+        auto_cfg.get(
+            "rate_seed",
+            2026,
+        )
+    )
+
+    if not (
+        0.0 <= min_rate <= 1.0
+    ):
         raise ValueError(
-            "client_noise_rates 长度不足"
+            "label_noise.auto.min_rate "
+            "必须位于 [0, 1]"
+        )
+
+    if not (
+        0.0 <= max_rate <= 1.0
+    ):
+        raise ValueError(
+            "label_noise.auto.max_rate "
+            "必须位于 [0, 1]"
+        )
+
+    if min_rate > max_rate:
+        raise ValueError(
+            "label_noise.auto.min_rate "
+            "不能大于 max_rate"
+        )
+
+    rng = np.random.default_rng(
+        rate_seed
+    )
+
+    if distribution == "linspace_shuffle":
+        # 固定覆盖整个区间，平均噪声率稳定，适合算法对比。
+        rates_array = np.linspace(
+            min_rate,
+            max_rate,
+            num=num_clients,
+            dtype=np.float64,
+        )
+
+        rng.shuffle(
+            rates_array
+        )
+
+    elif distribution == "uniform":
+        # 每个客户端独立均匀采样。
+        rates_array = rng.uniform(
+            low=min_rate,
+            high=max_rate,
+            size=num_clients,
+        )
+
+    else:
+        raise ValueError(
+            "label_noise.auto.distribution "
+            "仅支持 linspace_shuffle / uniform"
+        )
+
+    rates = [
+        float(rate)
+        for rate in rates_array.tolist()
+    ]
+
+    validate_client_noise_rates(
+        rates
+    )
+
+    return rates
+
+
+def get_client_noise_rate(
+    label_noise_cfg: Mapping,
+    client_id: int,
+    num_clients: int,
+    default_noise_rate: float,
+) -> float:
+    """
+    返回指定客户端的目标标签噪声率。
+    """
+    rates = resolve_client_noise_rates(
+        label_noise_cfg=(
+            label_noise_cfg
+        ),
+        num_clients=num_clients,
+        default_noise_rate=(
+            default_noise_rate
+        ),
+    )
+
+    client_id = int(
+        client_id
+    )
+
+    if not (
+        0 <= client_id < num_clients
+    ):
+        raise ValueError(
+            f"client_id={client_id} 越界，"
+            f"num_clients={num_clients}"
         )
 
     return float(
@@ -1758,6 +1978,11 @@ def build_client_dataset_with_optional_label_noise(
                 noise_cfg
             ),
             client_id=client_id,
+            num_clients=int(
+                dataset_cfg[
+                    "num_clients"
+                ]
+            ),
             default_noise_rate=float(
                 noise_cfg.get(
                     "noise_rate",
