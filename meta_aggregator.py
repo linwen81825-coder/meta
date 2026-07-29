@@ -260,9 +260,6 @@ class MetaExpertAggregator:
         "sample_ratio",
         "expert_freq",
         "expert_count_ratio",
-        "expert_loss_z",
-        "expert_loss_raw",
-        "delta_norm_z",
     }
 
     ALLOWED_TAU_SCHEDULES = {
@@ -325,6 +322,7 @@ class MetaExpertAggregator:
                 "min_active_clients_per_expert "
                 "必须 >= 1"
             )
+
 
         if (
             log_fn is None
@@ -733,97 +731,6 @@ class MetaExpertAggregator:
 
         return tensor
 
-    def build_delta_norm_z_feature(
-        self,
-        client_state_dicts: Sequence[
-            Mapping[str, torch.Tensor]
-        ],
-        global_state_dict: Mapping[
-            str,
-            torch.Tensor,
-        ],
-        num_clients: int,
-    ) -> torch.Tensor:
-        norms = torch.zeros(
-            self.num_experts,
-            num_clients,
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-        for expert_id in range(
-            self.num_experts
-        ):
-            names = [
-                name
-                for name
-                in global_state_dict.keys()
-                if (
-                    is_expert_param(name)
-                    and get_expert_id_from_name(
-                        name
-                    ) == expert_id
-                    and torch.is_floating_point(
-                        global_state_dict[name]
-                    )
-                )
-            ]
-
-            for (
-                client_id,
-                client_state,
-            ) in enumerate(
-                client_state_dicts
-            ):
-                squared_sum = torch.zeros(
-                    (),
-                    device=self.device,
-                )
-
-                for name in names:
-                    delta = (
-                        client_state[name]
-                        .to(self.device)
-                        .float()
-                        - global_state_dict[name]
-                        .to(self.device)
-                        .float()
-                    )
-
-                    squared_sum = (
-                        squared_sum
-                        + torch.sum(
-                            delta * delta
-                        )
-                    )
-
-                norms[
-                    expert_id,
-                    client_id,
-                ] = torch.sqrt(
-                    squared_sum.clamp_min(
-                        0.0
-                    )
-                )
-
-        mean = norms.mean(
-            dim=1,
-            keepdim=True,
-        )
-
-        std = (
-            norms.std(
-                dim=1,
-                unbiased=False,
-                keepdim=True,
-            )
-            .clamp_min(1e-6)
-        )
-
-        return (
-            norms - mean
-        ) / std
-
     def build_meta_features(
         self,
         client_losses: Sequence[float],
@@ -834,180 +741,111 @@ class MetaExpertAggregator:
         client_expert_counts: Sequence[
             Sequence[float]
         ],
-        client_expert_losses: Sequence[
-            Sequence[float]
-        ],
-        client_state_dicts: Sequence[
-            Mapping[str, torch.Tensor]
-        ],
-        global_state_dict: Mapping[
-            str,
-            torch.Tensor,
-        ],
     ) -> Tuple[
         torch.Tensor,
         Dict[str, torch.Tensor],
     ]:
+        """只构造当前配置实际使用的Meta特征。"""
         num_clients = self._num_clients(
             client_num_samples
         )
-
-        losses = self._as_client_vector(
-            client_losses,
-            num_clients,
-            "client_losses",
+        needed = set(
+            self.input_feature_names
         )
+        feature_values: Dict[
+            str,
+            torch.Tensor,
+        ] = {}
 
-        loss_mean = losses.mean()
-
-        loss_std = (
-            losses.std(
-                unbiased=False
-            )
-            .clamp_min(1e-6)
-        )
-
-        loss_z = (
-            (
-                losses - loss_mean
-            )
-            / loss_std
-        ).unsqueeze(0).expand(
-            self.num_experts,
-            num_clients,
-        )
-
-        loss_raw = (
-            losses
-            .unsqueeze(0)
-            .expand(
-                self.num_experts,
+        if needed & {
+            "loss_z",
+            "loss_raw",
+        }:
+            losses = self._as_client_vector(
+                client_losses,
                 num_clients,
+                "client_losses",
             )
-        )
 
-        sample_counts = (
-            self._as_client_vector(
+            if "loss_raw" in needed:
+                feature_values[
+                    "loss_raw"
+                ] = losses.unsqueeze(0).expand(
+                    self.num_experts,
+                    num_clients,
+                )
+
+            if "loss_z" in needed:
+                loss_mean = losses.mean()
+                loss_std = (
+                    losses.std(
+                        unbiased=False
+                    )
+                    .clamp_min(1e-6)
+                )
+                feature_values[
+                    "loss_z"
+                ] = (
+                    (
+                        losses - loss_mean
+                    )
+                    / loss_std
+                ).unsqueeze(0).expand(
+                    self.num_experts,
+                    num_clients,
+                )
+
+        if "sample_ratio" in needed:
+            sample_counts = self._as_client_vector(
                 client_num_samples,
                 num_clients,
                 "client_num_samples",
             )
-        )
+            feature_values[
+                "sample_ratio"
+            ] = (
+                sample_counts
+                / sample_counts.sum()
+                .clamp_min(1e-6)
+            ).unsqueeze(0).expand(
+                self.num_experts,
+                num_clients,
+            )
 
-        sample_ratio = (
-            sample_counts
-            / sample_counts.sum()
-            .clamp_min(1e-6)
-        ).unsqueeze(0).expand(
-            self.num_experts,
-            num_clients,
-        )
-
-        expert_freq = (
-            self._as_client_expert_matrix(
+        if "expert_freq" in needed:
+            feature_values[
+                "expert_freq"
+            ] = self._as_client_expert_matrix(
                 client_expert_freqs,
                 num_clients,
                 "client_expert_freqs",
-            )
-            .transpose(0, 1)
-        )
+            ).transpose(0, 1)
 
-        expert_counts = (
-            self._as_client_expert_matrix(
-                client_expert_counts,
-                num_clients,
-                "client_expert_counts",
+        if "expert_count_ratio" in needed:
+            expert_counts = (
+                self._as_client_expert_matrix(
+                    client_expert_counts,
+                    num_clients,
+                    "client_expert_counts",
+                )
+                .transpose(0, 1)
             )
-            .transpose(0, 1)
-        )
-
-        count_denom = (
-            expert_counts.sum(
+            count_denom = expert_counts.sum(
                 dim=1,
                 keepdim=True,
             )
-        )
-
-        uniform = torch.full_like(
-            expert_counts,
-            1.0 / num_clients,
-        )
-
-        expert_count_ratio = (
-            torch.where(
+            uniform = torch.full_like(
+                expert_counts,
+                1.0 / num_clients,
+            )
+            feature_values[
+                "expert_count_ratio"
+            ] = torch.where(
                 count_denom > 1e-12,
-                (
-                    expert_counts
-                    / count_denom.clamp_min(
-                        1e-12
-                    )
-                ),
+                expert_counts
+                / count_denom.clamp_min(1e-12),
                 uniform,
             )
-        )
-
-        expert_loss_raw = (
-            self._as_client_expert_matrix(
-                client_expert_losses,
-                num_clients,
-                "client_expert_losses",
-            )
-            .transpose(0, 1)
-        )
-
-        expert_loss_mean = (
-            expert_loss_raw.mean(
-                dim=1,
-                keepdim=True,
-            )
-        )
-
-        expert_loss_std = (
-            expert_loss_raw.std(
-                dim=1,
-                unbiased=False,
-                keepdim=True,
-            )
-            .clamp_min(1e-6)
-        )
-
-        expert_loss_z = (
-            (
-                expert_loss_raw
-                - expert_loss_mean
-            )
-            / expert_loss_std
-        )
-
-        delta_norm_z = (
-            self.build_delta_norm_z_feature(
-                client_state_dicts=(
-                    client_state_dicts
-                ),
-                global_state_dict=(
-                    global_state_dict
-                ),
-                num_clients=num_clients,
-            )
-        )
-
-        feature_values: Dict[
-            str,
-            torch.Tensor,
-        ] = {
-            "loss_z": loss_z,
-            "loss_raw": loss_raw,
-            "sample_ratio": sample_ratio,
-            "expert_freq": expert_freq,
-            "expert_count_ratio": (
-                expert_count_ratio
-            ),
-            "expert_loss_z": expert_loss_z,
-            "expert_loss_raw": (
-                expert_loss_raw
-            ),
-            "delta_norm_z": delta_norm_z,
-        }
 
         features = torch.stack(
             [
@@ -1326,17 +1164,11 @@ class MetaExpertAggregator:
         client_expert_counts: Sequence[
             Sequence[float]
         ],
-        client_expert_losses: Sequence[
-            Sequence[float]
-        ],
         pre_client_losses: Sequence[float],
         pre_client_expert_freqs: Sequence[
             Sequence[float]
         ],
         pre_client_expert_counts: Sequence[
-            Sequence[float]
-        ],
-        pre_client_expert_losses: Sequence[
             Sequence[float]
         ],
         val_loader: Iterable,
@@ -1380,18 +1212,6 @@ class MetaExpertAggregator:
             f"{self.tau_anneal_rounds}"
         )
 
-        global_state = {
-            name: (
-                tensor
-                .detach()
-                .cpu()
-                .clone()
-            )
-            for (
-                name,
-                tensor,
-            ) in model.state_dict().items()
-        }
 
         # 第一次输入始终使用训练前probe统计。
         (
@@ -1409,15 +1229,6 @@ class MetaExpertAggregator:
             ),
             client_expert_counts=(
                 pre_client_expert_counts
-            ),
-            client_expert_losses=(
-                pre_client_expert_losses
-            ),
-            client_state_dicts=(
-                client_state_dicts
-            ),
-            global_state_dict=(
-                global_state
             ),
         )
 
@@ -1525,15 +1336,6 @@ class MetaExpertAggregator:
                 ),
                 client_expert_counts=(
                     client_expert_counts
-                ),
-                client_expert_losses=(
-                    client_expert_losses
-                ),
-                client_state_dicts=(
-                    client_state_dicts
-                ),
-                global_state_dict=(
-                    global_state
                 ),
             )
 

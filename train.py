@@ -6,6 +6,7 @@ os.environ.setdefault(
 )
 
 import argparse
+import atexit
 import hashlib
 import json
 import platform
@@ -63,6 +64,7 @@ SEED_NAMESPACES = {
     "client_loader": "client_loader_v1",
     "pre_probe_loader": "pre_probe_loader_v1",
     "local_train": "local_train_v1",
+    "local_model_template": "local_model_template_v1",
     "server_val_loader": "server_val_loader_v1",
     "test_loader": "test_loader_v1",
     "meta_round": "meta_round_v1",
@@ -188,12 +190,7 @@ def copy_config_to_log_root(
 
 
 class TeeLogger:
-    """
-    控制台和日志同时输出。
-
-    每次写日志都重新以append模式打开，避免Meta诊断日志和主日志
-    使用两个长期文件句柄时互相覆盖。
-    """
+    """控制台与单个长期日志文件句柄同时输出。"""
 
     def __init__(
         self,
@@ -202,35 +199,78 @@ class TeeLogger:
     ):
         self.terminal = terminal
         self.log_path = log_path
-
-    def _append(
-        self,
-        message: str,
-    ) -> None:
-        with open(
+        self.log_file = open(
             self.log_path,
             "a",
             encoding="utf-8",
-        ) as log_file:
-            log_file.write(message)
-            log_file.flush()
+            buffering=1,
+        )
+        self._closed = False
 
     def write(
         self,
         message: str,
     ) -> None:
+        if self._closed:
+            return
         self.terminal.write(message)
-        self.terminal.flush()
-        self._append(message)
+        self.log_file.write(message)
 
     def write_log_only(
         self,
         message: str,
     ) -> None:
-        self._append(message)
+        if self._closed:
+            return
+        self.log_file.write(message)
 
     def flush(self) -> None:
+        if self._closed:
+            return
         self.terminal.flush()
+        self.log_file.flush()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.flush()
+        finally:
+            self.log_file.close()
+            self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def isatty(self) -> bool:
+        return bool(
+            getattr(
+                self.terminal,
+                "isatty",
+                lambda: False,
+            )()
+        )
+
+    def fileno(self) -> int:
+        return self.terminal.fileno()
+
+
+def close_logging() -> None:
+    """进程退出时刷新并关闭长期日志句柄。"""
+    global _ACTIVE_LOGGER
+
+    logger = _ACTIVE_LOGGER
+    if logger is None:
+        return
+
+    if sys.stdout is logger:
+        sys.stdout = logger.terminal
+    if sys.stderr is logger:
+        sys.stderr = logger.terminal
+
+    logger.close()
+    _ACTIVE_LOGGER = None
 
 
 def setup_logging(
@@ -238,6 +278,8 @@ def setup_logging(
     config_path: Optional[str] = None,
 ) -> str:
     global _ACTIVE_LOGGER
+
+    close_logging()
 
     log_path = get_log_path(cfg)
 
@@ -256,6 +298,7 @@ def setup_logging(
 
     sys.stdout = _ACTIVE_LOGGER
     sys.stderr = _ACTIVE_LOGGER
+    atexit.register(close_logging)
 
     copy_config_to_log_root(
         config_path,
@@ -2813,124 +2856,23 @@ def compute_router_balance_loss(
     )
 
 
-def update_expert_loss_stats(
-    expert_loss_sums: torch.Tensor,
-    expert_loss_weights: torch.Tensor,
-    per_sample_loss: torch.Tensor,
-    info: Mapping[
-        str,
-        torch.Tensor,
-    ],
-) -> None:
-    num_experts = (
-        expert_loss_sums.numel()
-    )
-
-    loss_cpu = (
-        per_sample_loss
-        .detach()
-        .cpu()
-        .float()
-    )
-
-    if "topk_indices" in info:
-        expert_indices = (
-            info[
-                "topk_indices"
-            ]
-            .detach()
-            .cpu()
+def resolve_autocast_dtype(
+    dtype_name: str,
+) -> torch.dtype:
+    normalized = str(dtype_name).strip().lower()
+    aliases = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "performance.test_autocast_dtype 仅支持 "
+            "float16/fp16 或 bfloat16/bf16"
         )
-
-        if "topk_gates" in info:
-            expert_gates = (
-                info[
-                    "topk_gates"
-                ]
-                .detach()
-                .cpu()
-                .float()
-            )
-
-        else:
-            expert_gates = (
-                torch.ones_like(
-                    expert_indices,
-                    dtype=torch.float32,
-                )
-            )
-
-            expert_gates = (
-                expert_gates
-                / expert_gates.size(1)
-            )
-
-        loss_expand = (
-            loss_cpu
-            .unsqueeze(1)
-            .expand_as(
-                expert_gates
-            )
-        )
-
-        flat_indices = (
-            expert_indices
-            .reshape(-1)
-        )
-
-        flat_gates = (
-            expert_gates
-            .reshape(-1)
-        )
-
-        flat_losses = (
-            loss_expand
-            .reshape(-1)
-        )
-
-        loss_sum = torch.bincount(
-            flat_indices,
-            weights=(
-                flat_losses
-                * flat_gates
-            ),
-            minlength=num_experts,
-        )
-
-        weight_sum = torch.bincount(
-            flat_indices,
-            weights=flat_gates,
-            minlength=num_experts,
-        )
-
-    else:
-        expert_indices = (
-            info[
-                "top1_indices"
-            ]
-            .detach()
-            .cpu()
-            .reshape(-1)
-        )
-
-        loss_sum = torch.bincount(
-            expert_indices,
-            weights=loss_cpu,
-            minlength=num_experts,
-        )
-
-        weight_sum = torch.bincount(
-            expert_indices,
-            minlength=num_experts,
-        ).float()
-
-    expert_loss_sums += (
-        loss_sum
-    )
-
-    expert_loss_weights += (
-        weight_sum
-    )
+    return aliases[normalized]
 
 
 @torch.no_grad()
@@ -2955,10 +2897,7 @@ def compute_probe_statistics(
             "meta.pre_probe_batches 必须大于 0"
         )
 
-    previous_training = (
-        model.training
-    )
-
+    previous_training = model.training
     model.eval()
 
     criterion = nn.CrossEntropyLoss(
@@ -2974,27 +2913,12 @@ def compute_probe_statistics(
         dtype=torch.long,
     )
 
-    expert_loss_sums = torch.zeros(
-        num_experts,
-        dtype=torch.float32,
-    )
-
-    expert_loss_weights = torch.zeros(
-        num_experts,
-        dtype=torch.float32,
-    )
-
     try:
         for (
             batch_id,
             (images, labels),
-        ) in enumerate(
-            probe_loader
-        ):
-            if (
-                batch_id
-                >= max_batches
-            ):
+        ) in enumerate(probe_loader):
+            if batch_id >= max_batches:
                 break
 
             images = images.to(
@@ -3003,7 +2927,6 @@ def compute_probe_statistics(
                     device.type == "cuda"
                 ),
             )
-
             labels = labels.to(
                 device,
                 non_blocking=(
@@ -3011,34 +2934,23 @@ def compute_probe_statistics(
                 ),
             )
 
-            (
-                logits,
-                info,
-            ) = model(
+            logits, info = model(
                 images,
                 return_info=True,
             )
 
             if "topk_indices" in info:
-                expert_indices = (
-                    info[
-                        "topk_indices"
-                    ]
-                )
+                expert_indices = info[
+                    "topk_indices"
+                ]
             else:
-                expert_indices = (
-                    info[
-                        "top1_indices"
-                    ]
-                )
+                expert_indices = info[
+                    "top1_indices"
+                ]
 
             update_expert_counts(
-                expert_counts=(
-                    expert_counts
-                ),
-                expert_indices=(
-                    expert_indices
-                ),
+                expert_counts=expert_counts,
+                expert_indices=expert_indices,
             )
 
             per_sample_loss = criterion(
@@ -3046,35 +2958,16 @@ def compute_probe_statistics(
                 labels,
             )
 
-            update_expert_loss_stats(
-                expert_loss_sums=(
-                    expert_loss_sums
-                ),
-                expert_loss_weights=(
-                    expert_loss_weights
-                ),
-                per_sample_loss=(
-                    per_sample_loss
-                ),
-                info=info,
-            )
-
             total_loss += (
-                per_sample_loss
-                .sum()
-                .item()
+                per_sample_loss.sum().item()
             )
-
             total_samples += int(
                 labels.size(0)
             )
-
             processed_batches += 1
 
     finally:
-        model.train(
-            previous_training
-        )
+        model.train(previous_training)
 
     if (
         processed_batches == 0
@@ -3084,57 +2977,21 @@ def compute_probe_statistics(
             "训练前 probe loader 没有产生任何 batch"
         )
 
-    avg_loss = (
-        total_loss
-        / total_samples
-    )
+    avg_loss = total_loss / total_samples
 
     expert_freq = (
-        counts_to_frequency(
-            expert_counts
-        )
+        counts_to_frequency(expert_counts)
         .numpy()
         .tolist()
     )
-
     expert_count_values = (
-        expert_counts
-        .numpy()
-        .tolist()
+        expert_counts.numpy().tolist()
     )
-
-    expert_loss_values: List[
-        float
-    ] = []
-
-    for expert_id in range(
-        num_experts
-    ):
-        weight = (
-            expert_loss_weights[
-                expert_id
-            ].item()
-        )
-
-        if weight > 0:
-            value = (
-                expert_loss_sums[
-                    expert_id
-                ].item()
-                / weight
-            )
-        else:
-            value = avg_loss
-
-        expert_loss_values.append(
-            float(value)
-        )
 
     return (
         float(avg_loss),
         expert_freq,
         expert_count_values,
-        expert_loss_values,
         processed_batches,
         total_samples,
     )
@@ -3145,14 +3002,13 @@ def compute_probe_statistics(
 # ------------------------------------------------------------
 
 def local_train(
+    model: nn.Module,
     global_state_dict: Mapping[
         str,
         torch.Tensor,
     ],
     train_loader: DataLoader,
-    probe_loader: Optional[
-        DataLoader
-    ],
+    probe_loader: Optional[DataLoader],
     pre_probe_batches: int,
     cfg: Mapping,
     device: torch.device,
@@ -3160,20 +3016,12 @@ def local_train(
     round_id: int,
     client_id: int,
 ):
-    train_cfg = cfg[
-        "train"
-    ]
-
-    model_cfg = cfg[
-        "model"
-    ]
+    train_cfg = cfg["train"]
+    model_cfg = cfg["model"]
 
     num_experts = int(
-        model_cfg[
-            "num_experts"
-        ]
+        model_cfg["num_experts"]
     )
-
     router_balance_weight = float(
         train_cfg.get(
             "router_balance_weight",
@@ -3183,9 +3031,7 @@ def local_train(
 
     local_seed = stable_seed(
         base_seed,
-        SEED_NAMESPACES[
-            "local_train"
-        ],
+        SEED_NAMESPACES["local_train"],
         round_id,
         client_id,
     )
@@ -3194,22 +3040,21 @@ def local_train(
         local_seed,
         device,
     ):
-        model = build_model(cfg)
-
+        # 所有客户端复用同一个模型实例。
+        # 每个客户端训练前完整加载本轮全局state_dict，
+        # 从而重置参数及BN等注册buffer。
         model.load_state_dict(
             global_state_dict,
             strict=True,
         )
-
+        model.zero_grad(set_to_none=True)
         model.to(device)
 
-        # 训练前probe统计。
         if probe_loader is not None:
             (
                 pre_loss,
                 pre_expert_freq,
                 pre_expert_counts,
-                pre_expert_losses,
                 actual_probe_batches,
                 actual_probe_samples,
             ) = compute_probe_statistics(
@@ -3217,26 +3062,16 @@ def local_train(
                 probe_loader=probe_loader,
                 num_experts=num_experts,
                 device=device,
-                max_batches=(
-                    pre_probe_batches
-                ),
+                max_batches=pre_probe_batches,
             )
-
         else:
             pre_loss = 0.0
-
             pre_expert_freq = [
                 0.0
             ] * num_experts
-
             pre_expert_counts = [
                 0
             ] * num_experts
-
-            pre_expert_losses = [
-                0.0
-            ] * num_experts
-
             actual_probe_batches = 0
             actual_probe_samples = 0
 
@@ -3245,14 +3080,9 @@ def local_train(
         criterion = nn.CrossEntropyLoss(
             reduction="none"
         )
-
         optimizer = torch.optim.SGD(
             model.parameters(),
-            lr=float(
-                train_cfg[
-                    "lr"
-                ]
-            ),
+            lr=float(train_cfg["lr"]),
             momentum=float(
                 train_cfg.get(
                     "momentum",
@@ -3269,132 +3099,75 @@ def local_train(
 
         total_loss = 0.0
         total_samples = 0
-
         expert_counts = torch.zeros(
             num_experts,
             dtype=torch.long,
         )
 
-        expert_loss_sums = torch.zeros(
-            num_experts,
-            dtype=torch.float32,
-        )
-
-        expert_loss_weights = torch.zeros(
-            num_experts,
-            dtype=torch.float32,
-        )
-
         local_epochs = int(
-            train_cfg[
-                "local_epochs"
-            ]
+            train_cfg["local_epochs"]
         )
 
-        for _ in range(
-            local_epochs
-        ):
-            for (
-                images,
-                labels,
-            ) in train_loader:
+        for _ in range(local_epochs):
+            for images, labels in train_loader:
                 images = images.to(
                     device,
                     non_blocking=(
-                        device.type
-                        == "cuda"
+                        device.type == "cuda"
                     ),
                 )
-
                 labels = labels.to(
                     device,
                     non_blocking=(
-                        device.type
-                        == "cuda"
+                        device.type == "cuda"
                     ),
                 )
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
 
-                (
-                    logits,
-                    info,
-                ) = model(
+                logits, info = model(
                     images,
                     return_info=True,
                 )
 
                 if "topk_indices" in info:
-                    expert_indices = (
-                        info[
-                            "topk_indices"
-                        ]
-                    )
+                    expert_indices = info[
+                        "topk_indices"
+                    ]
                 else:
-                    expert_indices = (
-                        info[
-                            "top1_indices"
-                        ]
-                    )
+                    expert_indices = info[
+                        "top1_indices"
+                    ]
 
                 update_expert_counts(
-                    expert_counts=(
-                        expert_counts
-                    ),
-                    expert_indices=(
-                        expert_indices
-                    ),
+                    expert_counts=expert_counts,
+                    expert_indices=expert_indices,
                 )
 
-                per_sample_ce_loss = (
-                    criterion(
-                        logits,
-                        labels,
-                    )
+                per_sample_ce_loss = criterion(
+                    logits,
+                    labels,
                 )
-
                 ce_loss = (
-                    per_sample_ce_loss
-                    .mean()
-                )
-
-                update_expert_loss_stats(
-                    expert_loss_sums=(
-                        expert_loss_sums
-                    ),
-                    expert_loss_weights=(
-                        expert_loss_weights
-                    ),
-                    per_sample_loss=(
-                        per_sample_ce_loss
-                    ),
-                    info=info,
+                    per_sample_ce_loss.mean()
                 )
 
                 balance_loss = torch.tensor(
                     0.0,
                     device=device,
                 )
-
-                if (
-                    router_balance_weight
-                    > 0
-                ):
-                    if (
-                        "router_probs"
-                        not in info
-                    ):
+                if router_balance_weight > 0:
+                    if "router_probs" not in info:
                         raise ValueError(
                             "model(images, return_info=True) "
                             "没有返回 router_probs，请先在 "
                             "model.py 的 info 中加入。"
                         )
-
                     balance_loss = (
                         compute_router_balance_loss(
-                            info[
-                                "router_probs"
-                            ]
+                            info["router_probs"]
                         )
                     )
 
@@ -3403,13 +3176,8 @@ def local_train(
                     + router_balance_weight
                     * balance_loss
                 )
-
                 loss.backward()
                 optimizer.step()
-
-                batch_size = (
-                    images.size(0)
-                )
 
                 total_loss += (
                     per_sample_ce_loss
@@ -3417,79 +3185,37 @@ def local_train(
                     .sum()
                     .item()
                 )
-
-                total_samples += (
-                    batch_size
+                total_samples += int(
+                    images.size(0)
                 )
 
-        avg_loss = (
-            total_loss
-            / max(
-                total_samples,
-                1,
-            )
+        avg_loss = total_loss / max(
+            total_samples,
+            1,
         )
-
         expert_freq = (
-            counts_to_frequency(
-                expert_counts
-            )
+            counts_to_frequency(expert_counts)
             .numpy()
             .tolist()
         )
-
         expert_count_values = (
-            expert_counts
-            .numpy()
-            .tolist()
+            expert_counts.numpy().tolist()
         )
-
-        expert_loss_values: List[
-            float
-        ] = []
-
-        for expert_id in range(
-            num_experts
-        ):
-            weight = (
-                expert_loss_weights[
-                    expert_id
-                ].item()
-            )
-
-            if weight > 0:
-                value = (
-                    expert_loss_sums[
-                        expert_id
-                    ].item()
-                    / weight
-                )
-            else:
-                value = avg_loss
-
-            expert_loss_values.append(
-                float(value)
-            )
 
         local_state_dict = {
             name: (
-                tensor
-                .detach()
-                .cpu()
-                .clone()
+                tensor.detach().cpu().clone()
             )
             for name, tensor
             in model.state_dict().items()
         }
-
         num_samples = len(
             train_loader.dataset
         )
 
-        del model
-
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        # 复用模型，不在每个客户端结束后调用
+        # torch.cuda.empty_cache()。
+        del optimizer
 
     return (
         local_state_dict,
@@ -3497,11 +3223,9 @@ def local_train(
         avg_loss,
         expert_freq,
         expert_count_values,
-        expert_loss_values,
         pre_loss,
         pre_expert_freq,
         pre_expert_counts,
-        pre_expert_losses,
         actual_probe_batches,
         actual_probe_samples,
     )
@@ -3516,6 +3240,8 @@ def evaluate(
     model: nn.Module,
     test_loader: DataLoader,
     device: torch.device,
+    use_autocast: bool = True,
+    autocast_dtype: torch.dtype = torch.float16,
 ) -> Tuple[float, float]:
     model.to(device)
     model.eval()
@@ -3541,10 +3267,23 @@ def evaluate(
             ),
         )
 
-        logits = model(images)
+        autocast_enabled = bool(
+            use_autocast
+            and device.type == "cuda"
+        )
 
+        if autocast_enabled:
+            with torch.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+            ):
+                logits = model(images)
+        else:
+            logits = model(images)
+
+        # 前向使用FP16/BF16，loss归约仍转回FP32。
         loss = criterion(
-            logits,
+            logits.float(),
             labels,
         )
 
@@ -4084,6 +3823,49 @@ def main() -> None:
         {},
     )
 
+    performance_cfg = cfg.get(
+        "performance",
+        {},
+    ) or {}
+
+    reuse_local_model = bool(
+        performance_cfg.get(
+            "reuse_local_model",
+            True,
+        )
+    )
+    if not reuse_local_model:
+        raise ValueError(
+            "当前优化版要求 performance.reuse_local_model=true"
+        )
+
+    test_autocast = bool(
+        performance_cfg.get(
+            "test_autocast",
+            True,
+        )
+    )
+    test_autocast_dtype_name = str(
+        performance_cfg.get(
+            "test_autocast_dtype",
+            "float16",
+        )
+    )
+    test_autocast_dtype = resolve_autocast_dtype(
+        test_autocast_dtype_name
+    )
+
+    meta_input_features = list(
+        meta_cfg.get(
+            "input_features",
+            [
+                "loss_z",
+                "sample_ratio",
+                "expert_freq",
+            ],
+        )
+    )
+
     pre_probe_batches = int(
         meta_cfg.get(
             "pre_probe_batches",
@@ -4146,6 +3928,29 @@ def main() -> None:
         f"{effective_num_workers}"
     )
 
+    local_model_seed = stable_seed(
+        seed,
+        SEED_NAMESPACES[
+            "local_model_template"
+        ],
+    )
+
+    with isolated_rng(
+        local_model_seed,
+        device,
+    ):
+        local_model = build_model(cfg)
+
+    local_model.to(device)
+    local_model.zero_grad(
+        set_to_none=True
+    )
+
+    log_only(
+        "[REPRO] local_model_template_seed="
+        f"{local_model_seed}"
+    )
+
     best_acc = 0.0
 
     test_acc_history: List[
@@ -4157,6 +3962,7 @@ def main() -> None:
             "expert_agg"
         ]
     )
+
 
     non_expert_agg = str(
         agg_cfg[
@@ -4296,14 +4102,7 @@ def main() -> None:
                         )
                     ),
                     input_features=(
-                        meta_cfg.get(
-                            "input_features",
-                            [
-                                "loss_z",
-                                "sample_ratio",
-                                "expert_freq",
-                            ],
-                        )
+                        meta_input_features
                     ),
                 )
             )
@@ -4466,6 +4265,25 @@ def main() -> None:
         )
 
     print(
+        "---------- 性能优化 ----------"
+    )
+    print(
+        f"reuse_local_model   : "
+        f"{reuse_local_model}"
+    )
+    print(
+        "empty_cache/client  : False"
+    )
+    print(
+        f"test_autocast       : "
+        f"{test_autocast}"
+    )
+    print(
+        f"test_autocast_dtype : "
+        f"{test_autocast_dtype_name}"
+    )
+
+    print(
         "=============================="
     )
 
@@ -4495,12 +4313,10 @@ def main() -> None:
         client_losses = []
         client_expert_freqs = []
         client_expert_counts = []
-        client_expert_losses = []
 
         pre_client_losses = []
         pre_client_expert_freqs = []
         pre_client_expert_counts = []
-        pre_client_expert_losses = []
 
         for client_id in (
             selected_clients
@@ -4551,14 +4367,13 @@ def main() -> None:
                 avg_loss,
                 expert_freq,
                 expert_count_values,
-                expert_loss,
                 pre_loss,
                 pre_expert_freq,
                 pre_expert_count_values,
-                pre_expert_loss,
                 actual_probe_batches,
                 actual_probe_samples,
             ) = local_train(
+                model=local_model,
                 global_state_dict=(
                     global_state_dict
                 ),
@@ -4661,9 +4476,6 @@ def main() -> None:
                 expert_count_values
             )
 
-            client_expert_losses.append(
-                expert_loss
-            )
 
             pre_client_losses.append(
                 pre_loss
@@ -4677,9 +4489,6 @@ def main() -> None:
                 pre_expert_count_values
             )
 
-            pre_client_expert_losses.append(
-                pre_expert_loss
-            )
 
         meta_info = None
 
@@ -4721,9 +4530,6 @@ def main() -> None:
                     client_expert_counts=(
                         client_expert_counts
                     ),
-                    client_expert_losses=(
-                        client_expert_losses
-                    ),
                     pre_client_losses=(
                         pre_client_losses
                     ),
@@ -4732,9 +4538,6 @@ def main() -> None:
                     ),
                     pre_client_expert_counts=(
                         pre_client_expert_counts
-                    ),
-                    pre_client_expert_losses=(
-                        pre_client_expert_losses
                     ),
                     val_loader=(
                         server_val_loader
@@ -4806,6 +4609,12 @@ def main() -> None:
                 model=global_model,
                 test_loader=test_loader,
                 device=device,
+                use_autocast=(
+                    test_autocast
+                ),
+                autocast_dtype=(
+                    test_autocast_dtype
+                ),
             )
 
         test_acc_history.append(

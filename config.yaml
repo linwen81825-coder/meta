@@ -82,10 +82,7 @@ meta:
     - loss_z
     - sample_ratio
     - expert_freq
-    - delta_norm_z
-    - expert_loss_z
     - loss_raw
-    - expert_loss_raw
     - expert_count_ratio
   active_mask: true
   active_threshold: 0.0
