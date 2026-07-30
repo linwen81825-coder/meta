@@ -2899,7 +2899,6 @@ def compute_probe_statistics(
 
     previous_training = model.training
     model.eval()
-
     criterion = nn.CrossEntropyLoss(
         reduction="none"
     )
@@ -2978,7 +2977,6 @@ def compute_probe_statistics(
         )
 
     avg_loss = total_loss / total_samples
-
     expert_freq = (
         counts_to_frequency(expert_counts)
         .numpy()
@@ -3018,7 +3016,6 @@ def local_train(
 ):
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
-
     num_experts = int(
         model_cfg["num_experts"]
     )
@@ -3076,13 +3073,45 @@ def local_train(
             actual_probe_samples = 0
 
         model.train()
-
         criterion = nn.CrossEntropyLoss(
             reduction="none"
         )
+
+        local_lr = float(
+            train_cfg["lr"]
+        )
+        if str(
+            train_cfg.get(
+                "lr_schedule",
+                "constant",
+            )
+        ).lower() == "multistep":
+            decay_count = sum(
+                round_id >= int(milestone)
+                for milestone in train_cfg.get(
+                    "lr_milestones",
+                    [],
+                )
+            )
+            local_lr = max(
+                local_lr
+                * float(
+                    train_cfg.get(
+                        "lr_gamma",
+                        1.0,
+                    )
+                ) ** decay_count,
+                float(
+                    train_cfg.get(
+                        "min_lr",
+                        0.0,
+                    )
+                ),
+            )
+
         optimizer = torch.optim.SGD(
             model.parameters(),
-            lr=float(train_cfg["lr"]),
+            lr=local_lr,
             momentum=float(
                 train_cfg.get(
                     "momentum",
@@ -3107,7 +3136,6 @@ def local_train(
         local_epochs = int(
             train_cfg["local_epochs"]
         )
-
         for _ in range(local_epochs):
             for images, labels in train_loader:
                 images = images.to(
@@ -3122,7 +3150,6 @@ def local_train(
                         device.type == "cuda"
                     ),
                 )
-
                 optimizer.zero_grad(
                     set_to_none=True
                 )
@@ -3201,7 +3228,6 @@ def local_train(
         expert_count_values = (
             expert_counts.numpy().tolist()
         )
-
         local_state_dict = {
             name: (
                 tensor.detach().cpu().clone()
@@ -3271,7 +3297,6 @@ def evaluate(
             use_autocast
             and device.type == "cuda"
         )
-
         if autocast_enabled:
             with torch.autocast(
                 device_type="cuda",
@@ -3293,7 +3318,6 @@ def evaluate(
         )
 
         batch_size = images.size(0)
-
         total_loss += (
             loss.item()
             * batch_size
@@ -3305,17 +3329,20 @@ def evaluate(
 
         total += batch_size
 
-    if total <= 0:
-        raise ValueError(
-            "测试 DataLoader 为空"
-        )
+    accuracy = (
+        100.0
+        * correct
+        / max(total, 1)
+    )
+
+    average_loss = (
+        total_loss
+        / max(total, 1)
+    )
 
     return (
-        correct
-        / total
-        * 100.0,
-        total_loss
-        / total,
+        accuracy,
+        average_loss,
     )
 
 
@@ -3854,7 +3881,6 @@ def main() -> None:
     test_autocast_dtype = resolve_autocast_dtype(
         test_autocast_dtype_name
     )
-
     meta_input_features = list(
         meta_cfg.get(
             "input_features",
@@ -3962,7 +3988,6 @@ def main() -> None:
             "expert_agg"
         ]
     )
-
 
     non_expert_agg = str(
         agg_cfg[
@@ -4155,6 +4180,22 @@ def main() -> None:
         f"{train_cfg['lr']}"
     )
     print(
+        f"lr_schedule         : "
+        f"{train_cfg.get('lr_schedule', 'constant')}"
+    )
+    print(
+        f"lr_milestones       : "
+        f"{train_cfg.get('lr_milestones', [])}"
+    )
+    print(
+        f"lr_gamma            : "
+        f"{train_cfg.get('lr_gamma', 1.0)}"
+    )
+    print(
+        f"min_lr              : "
+        f"{train_cfg.get('min_lr', 0.0)}"
+    )
+    print(
         f"momentum            : "
         f"{train_cfg.get('momentum', 0.9)}"
     )
@@ -4291,6 +4332,38 @@ def main() -> None:
         1,
         rounds + 1,
     ):
+        current_round_lr = float(
+            train_cfg["lr"]
+        )
+        if str(
+            train_cfg.get(
+                "lr_schedule",
+                "constant",
+            )
+        ).lower() == "multistep":
+            decay_count = sum(
+                round_id >= int(milestone)
+                for milestone in train_cfg.get(
+                    "lr_milestones",
+                    [],
+                )
+            )
+            current_round_lr = max(
+                current_round_lr
+                * float(
+                    train_cfg.get(
+                        "lr_gamma",
+                        1.0,
+                    )
+                ) ** decay_count,
+                float(
+                    train_cfg.get(
+                        "min_lr",
+                        0.0,
+                    )
+                ),
+            )
+
         global_state_dict = {
             name: (
                 tensor
@@ -4476,7 +4549,6 @@ def main() -> None:
                 expert_count_values
             )
 
-
             pre_client_losses.append(
                 pre_loss
             )
@@ -4488,7 +4560,6 @@ def main() -> None:
             pre_client_expert_counts.append(
                 pre_expert_count_values
             )
-
 
         meta_info = None
 
@@ -4641,6 +4712,8 @@ def main() -> None:
 
             print(
                 f"Round {round_id:03d} | "
+                f"lr="
+                f"{current_round_lr:.8f} | "
                 f"client_loss="
                 f"{avg_client_loss:.4f} | "
                 f"meta_loss="
@@ -4656,6 +4729,8 @@ def main() -> None:
         else:
             print(
                 f"Round {round_id:03d} | "
+                f"lr="
+                f"{current_round_lr:.8f} | "
                 f"client_loss="
                 f"{avg_client_loss:.4f} | "
                 f"test_loss="

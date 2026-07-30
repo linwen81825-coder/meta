@@ -49,6 +49,13 @@ train:
   local_epochs: 1
   batch_size: 64
   lr: 0.01
+  lr_schedule: multistep
+  lr_milestones:
+    - 180
+    - 260
+    - 400
+  lr_gamma: 0.5
+  min_lr: 0.0005
   momentum: 0.9
   weight_decay: 0.0005
   test_batch_size: 256
