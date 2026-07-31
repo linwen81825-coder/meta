@@ -3026,6 +3026,22 @@ def local_train(
         )
     )
 
+    label_smoothing = float(
+        train_cfg.get(
+            "label_smoothing",
+            0.0,
+        )
+    )
+
+    if not (
+        0.0
+        <= label_smoothing
+        < 1.0
+    ):
+        raise ValueError(
+            "train.label_smoothing 必须位于 [0, 1)"
+        )
+
     local_seed = stable_seed(
         base_seed,
         SEED_NAMESPACES["local_train"],
@@ -3073,7 +3089,13 @@ def local_train(
             actual_probe_samples = 0
 
         model.train()
-        criterion = nn.CrossEntropyLoss(
+        train_criterion = nn.CrossEntropyLoss(
+            reduction="none",
+            label_smoothing=(
+                label_smoothing
+            ),
+        )
+        metric_criterion = nn.CrossEntropyLoss(
             reduction="none"
         )
 
@@ -3173,13 +3195,19 @@ def local_train(
                     expert_indices=expert_indices,
                 )
 
-                per_sample_ce_loss = criterion(
+                per_sample_train_loss = train_criterion(
                     logits,
                     labels,
                 )
                 ce_loss = (
-                    per_sample_ce_loss.mean()
+                    per_sample_train_loss.mean()
                 )
+
+                with torch.no_grad():
+                    per_sample_ce_loss = metric_criterion(
+                        logits,
+                        labels,
+                    )
 
                 balance_loss = torch.tensor(
                     0.0,
@@ -4178,6 +4206,10 @@ def main() -> None:
     print(
         f"lr                  : "
         f"{train_cfg['lr']}"
+    )
+    print(
+        f"label_smoothing     : "
+        f"{train_cfg.get('label_smoothing', 0.0)}"
     )
     print(
         f"lr_schedule         : "

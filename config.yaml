@@ -61,6 +61,7 @@ train:
   test_batch_size: 256
   num_workers: 2
   router_balance_weight: 0.01
+  label_smoothing: 0.1
 
 server:
   val_size: 1000
